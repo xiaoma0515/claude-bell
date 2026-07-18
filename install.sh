@@ -26,7 +26,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION=1.1.0
+VERSION=1.1.1
 
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 HOOK_DIR="$CLAUDE_DIR/hooks"
@@ -93,7 +93,24 @@ apply_quiet_readline() {
 # straight to the pts and is unaffected by this.
 set bell-style none
 RC
-  c_ok "added 'set bell-style none' to ~/.inputrc (applies to new shells)"
+  c_ok "added 'set bell-style none' to ~/.inputrc"
+  RELOAD_NEEDED=1
+}
+
+# readline parses ~/.inputrc once, at shell startup. The shell that ran this
+# installer therefore keeps its old setting and keeps beeping — which reads as
+# "I ran it and it still beeps". Say so loudly rather than in passing.
+warn_reload_needed() {
+  [ "${RELOAD_NEEDED:-0}" = 1 ] || return 0
+  printf '\n\033[33m┌─ readline: your CURRENT shell is not updated yet ─────────────┐\033[0m\n'
+  printf '\033[33m│\033[0m readline reads ~/.inputrc only at startup, so this shell\n'
+  printf '\033[33m│\033[0m keeps beeping until you do one of:\n'
+  printf '\033[33m│\033[0m\n'
+  printf '\033[33m│\033[0m     \033[1mbind -f ~/.inputrc\033[0m      ← applies right now\n'
+  printf '\033[33m│\033[0m     reconnect                ← new shells are already fine\n'
+  printf '\033[33m│\033[0m\n'
+  printf '\033[33m│\033[0m Verify with:  bind -v | grep bell-style\n'
+  printf '\033[33m└──────────────────────────────────────────────────────────────┘\033[0m\n'
 }
 
 # ------------------------------------------------------------------ preflight
@@ -442,3 +459,5 @@ Beeping when nothing is running? Two usual causes, neither is a hook firing:
   b. A background agent session. Silent by design here — check the log; if
      nothing was appended when you heard the beep, it wasn't this project.
 EOF
+
+warn_reload_needed

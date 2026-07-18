@@ -107,7 +107,11 @@ Silence readline without touching this project's beeps:
 
 That writes `set bell-style none` to `~/.inputrc`. It's safe: `bell.sh` writes BEL straight to the pts device, so readline isn't in that path and the notification beeps still work. If `~/.inputrc` didn't exist, the installer also adds `$include /etc/inputrc` first — creating that file otherwise suppresses your distro's key bindings.
 
-Takes effect in new shells (or `bind -f ~/.inputrc` right now).
+> **The shell you ran it from will keep beeping.** readline parses `~/.inputrc`
+> once, at startup, so the session you installed from still holds the old
+> setting. Either run `bind -f ~/.inputrc` to apply it immediately, or
+> reconnect — new shells are already correct. Check with
+> `bind -v | grep bell-style`.
 
 **Not sure whether a beep came from this project?** `bell.sh` logs every invocation. If nothing was appended to `~/.claude/hooks/bell.log` at the moment you heard it, the hook never ran and the sound came from somewhere else.
 

@@ -106,7 +106,9 @@ cd claude-bell && ./install.sh
 
 它往 `~/.inputrc` 写 `set bell-style none`。安全的原因是：`bell.sh` 直接往 pts 设备写 BEL，readline 根本不在这条路径上，提示音照响。另外如果 `~/.inputrc` 原本不存在，安装器会先补一行 `$include /etc/inputrc` —— 因为一旦这个文件存在，bash 就不再读 `/etc/inputrc`，会丢掉发行版的键位绑定（很多系统上的 Home/End/Delete）。
 
-新开的 shell 生效（或者当场 `bind -f ~/.inputrc`）。
+> **你运行它的那个 shell 还会继续响。** readline 只在启动时读一次 `~/.inputrc`，
+> 所以你装的时候所在的那个会话仍然是旧设置。要么敲 `bind -f ~/.inputrc` 当场生效，
+> 要么断开重连 —— 新会话已经是对的。用 `bind -v | grep bell-style` 确认。
 
 **分不清某次响是不是本项目发的？** `bell.sh` 每次被调用都会记日志。如果你听见响的那一刻 `~/.claude/hooks/bell.log` 没有新增行，那 hook 压根没跑，声音是别处来的。
 
