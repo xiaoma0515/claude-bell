@@ -46,9 +46,10 @@ cd claude-bell && ./install.sh
 安装器是**幂等**的，随时重跑即升级。它会合并进已有的 `~/.claude/settings.json` 而不是覆盖，写入前先摘掉自己上次留下的条目（所以不会越装响得越多），动过的文件都留备份。
 
 ```
-./install.sh              安装 / 升级
-./install.sh --check      只体检，不碰任何文件
-./install.sh --uninstall  卸载 hook 和脚本
+./install.sh                   安装 / 升级
+./install.sh --check           只体检，不碰任何文件
+./install.sh --uninstall       卸载 hook 和脚本
+./install.sh --quiet-readline  顺便关掉 readline 自己的铃（见下）
 ```
 
 ## 配置终端（PC 那半边）
@@ -84,6 +85,31 @@ cd claude-bell && ./install.sh
 | `Stop` | Claude 干完一轮 | 一声 |
 | `Notification` | Claude 要你确认（权限提示、空闲提醒） | 两声 |
 
+## 「装完之后开始乱响」
+
+基本可以断定是 **bash**，不是 Claude Code。
+
+打开响铃是**终端级**开关，没法只对某个程序生效 —— 终端收到的**任何** BEL 字节都会播。而 readline 一直在悄悄发这个字节：只要某个键按下去什么也干不成，它就响。
+
+- 空行按退格
+- 光标在行首按左方向键、在行尾按右方向键
+- Tab 补全没有候选
+- 反向搜索没有匹配
+
+这个行为比本项目早了几十年。变的只是你把终端配成了「收到 BEL 就出声」，于是**开始听得见**了。而促使你去配这个开关的正是本项目，所以体感上像是它造成的。
+
+关掉 readline 的铃，同时不影响本项目的提示音：
+
+```bash
+./install.sh --quiet-readline
+```
+
+它往 `~/.inputrc` 写 `set bell-style none`。安全的原因是：`bell.sh` 直接往 pts 设备写 BEL，readline 根本不在这条路径上，提示音照响。另外如果 `~/.inputrc` 原本不存在，安装器会先补一行 `$include /etc/inputrc` —— 因为一旦这个文件存在，bash 就不再读 `/etc/inputrc`，会丢掉发行版的键位绑定（很多系统上的 Home/End/Delete）。
+
+新开的 shell 生效（或者当场 `bind -f ~/.inputrc`）。
+
+**分不清某次响是不是本项目发的？** `bell.sh` 每次被调用都会记日志。如果你听见响的那一刻 `~/.claude/hooks/bell.log` 没有新增行，那 hook 压根没跑，声音是别处来的。
+
 ## 后台 agent 刻意不响
 
 如果你会用后台 agent、开多个终端、或者同时跑几个项目，那么**每一个会话都是完整的 Claude Code 会话，各自触发自己的 `Stop` hook** —— 因为 `~/.claude/settings.json` 是全局的。
@@ -109,6 +135,7 @@ $ tail ~/.claude/hooks/bell.log
 
 | 现象 | 查什么 |
 |---|---|
+| 没任务却在响 | 基本都是 readline 而非 hook —— 见上一节，`--quiet-readline` 可修 |
 | 完全没声音 | `tail ~/.claude/hooks/bell.log`。看到 `strategy1`/`strategy2` 就说明服务器侧没问题，是终端配置的事 |
 | 日志写 `no controlling tty` | 那个会话是后台 agent，设计上就不响 |
 | 日志里什么都没有 | hook 没接上。重跑 `./install.sh`，顺便看下 `~/.claude/settings.json` |

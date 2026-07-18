@@ -47,9 +47,10 @@ cd claude-bell && ./install.sh
 The installer is **idempotent** — re-run it any time to upgrade. It merges into an existing `~/.claude/settings.json` rather than overwriting, strips its own previous entries so beeps never stack up, and backs up anything it touches.
 
 ```
-./install.sh              install / upgrade
-./install.sh --check      preflight only, touches nothing
-./install.sh --uninstall  remove the hook and the script
+./install.sh                   install / upgrade
+./install.sh --check           preflight only, touches nothing
+./install.sh --uninstall       remove the hook and the script
+./install.sh --quiet-readline  also silence readline's own bell (see below)
 ```
 
 ## Configure your terminal (the PC half)
@@ -85,6 +86,31 @@ Your terminal has to actually make noise when it receives BEL. Once per machine,
 | `Stop` | Claude finishes a turn | one beep |
 | `Notification` | Claude wants your attention (permission prompt, idle) | two beeps |
 
+## "It started beeping at random after I installed this"
+
+Almost certainly **bash**, not Claude Code.
+
+Turning on a bell sound is a *terminal-level* switch. It cannot be scoped to one program, so it applies to every BEL byte the terminal receives — and readline has been quietly emitting them all along. It rings whenever a key can't do anything:
+
+- backspace on an empty line
+- left arrow at the start of the line, right arrow at the end
+- tab with no completion candidates
+- reverse-i-search with no match
+
+This behaviour predates the install by decades. What changed is that you configured your terminal to make BEL audible, so you started *hearing* it. Installing this project is what prompts that, which is why it feels caused by it.
+
+Silence readline without touching this project's beeps:
+
+```bash
+./install.sh --quiet-readline
+```
+
+That writes `set bell-style none` to `~/.inputrc`. It's safe: `bell.sh` writes BEL straight to the pts device, so readline isn't in that path and the notification beeps still work. If `~/.inputrc` didn't exist, the installer also adds `$include /etc/inputrc` first — creating that file otherwise suppresses your distro's key bindings.
+
+Takes effect in new shells (or `bind -f ~/.inputrc` right now).
+
+**Not sure whether a beep came from this project?** `bell.sh` logs every invocation. If nothing was appended to `~/.claude/hooks/bell.log` at the moment you heard it, the hook never ran and the sound came from somewhere else.
+
 ## Background agents stay silent — on purpose
 
 If you use background agents, other terminals, or several projects at once, **every one of those sessions is a full Claude Code session firing its own `Stop` hook**, because `~/.claude/settings.json` is global.
@@ -110,6 +136,7 @@ $ tail ~/.claude/hooks/bell.log
 
 | Symptom | Check |
 |---|---|
+| Beeps when nothing is running | Almost always readline, not a hook — see the section above. `--quiet-readline` fixes it. |
 | No sound at all | `tail ~/.claude/hooks/bell.log`. If you see `strategy1`/`strategy2`, the server side worked and the problem is your terminal config. |
 | Log says `no controlling tty` | That session is a background agent. Silent by design — see above. |
 | Nothing in the log | The hook isn't wired. Re-run `./install.sh`, and check `~/.claude/settings.json`. |

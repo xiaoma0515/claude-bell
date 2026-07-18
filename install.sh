@@ -12,9 +12,10 @@
 #                                                    applies to every host
 #
 #  Usage:
-#      ./install.sh              install / upgrade (idempotent)
-#      ./install.sh --check      preflight only, touches nothing
-#      ./install.sh --uninstall  remove hook and script
+#      ./install.sh                   install / upgrade (idempotent)
+#      ./install.sh --check           preflight only, touches nothing
+#      ./install.sh --uninstall       remove hook and script
+#      ./install.sh --quiet-readline  also silence readline's own bell
 #
 #  Remote one-liner:
 #      bash <(curl -fsSL https://raw.githubusercontent.com/xiaoma0515/claude-bell/main/install.sh)
@@ -25,7 +26,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION=1.0.0
+VERSION=1.1.0
 
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 HOOK_DIR="$CLAUDE_DIR/hooks"
@@ -38,14 +39,62 @@ c_err()  { printf '  \033[31m✗\033[0m %s\n' "$*"; }
 hdr()    { printf '\n\033[1m%s\033[0m\n' "$*"; }
 
 MODE=install
-case "${1:-}" in
-  --uninstall) MODE=uninstall ;;
-  --check)     MODE=check ;;
-  --version)   echo "claude-bell $VERSION"; exit 0 ;;
-  --help|-h)   sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-  "")          ;;
-  *)           c_err "unknown argument: $1 (try --help)"; exit 2 ;;
-esac
+QUIET_READLINE=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --uninstall)      MODE=uninstall ;;
+    --check)          MODE=check ;;
+    --quiet-readline) QUIET_READLINE=1 ;;
+    --version)        echo "claude-bell $VERSION"; exit 0 ;;
+    --help|-h)        sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)                c_err "unknown argument: $1 (try --help)"; exit 2 ;;
+  esac
+  shift
+done
+
+# Would readline ring an audible bell? Its default is audible, and once you
+# have configured your terminal to play a sound on BEL, every readline bell
+# becomes audible too: backspace on an empty line, arrow key at the edge of
+# the line, tab with no completion. None of that involves this project, but
+# it starts being heard the moment you set this up — so we surface it.
+readline_bell_audible() {
+  local f v
+  for f in "$HOME/.inputrc" /etc/inputrc; do
+    [ -f "$f" ] || continue
+    v=$(grep -iE '^[[:space:]]*set[[:space:]]+bell-style' "$f" | tail -1 | awk '{print $3}')
+    if [ -n "$v" ]; then
+      [ "$v" = audible ] && return 0 || return 1
+    fi
+    # A ~/.inputrc that exists but is silent on bell-style still wins: bash
+    # does not read /etc/inputrc once ~/.inputrc is present (absent $include).
+    [ "$f" = "$HOME/.inputrc" ] && return 0
+  done
+  return 0  # readline's built-in default
+}
+
+apply_quiet_readline() {
+  local rc="$HOME/.inputrc"
+  if [ -f "$rc" ] && grep -qiE '^[[:space:]]*set[[:space:]]+bell-style[[:space:]]+none' "$rc"; then
+    c_ok "~/.inputrc already sets bell-style none"
+    return
+  fi
+  if [ -f "$rc" ]; then
+    cp -p "$rc" "$rc.bak.$(date +%Y%m%d%H%M%S)"
+  else
+    # Creating ~/.inputrc suppresses /etc/inputrc entirely, which would drop
+    # the distro's key bindings (Home/End/Delete on many systems). Pull it
+    # back in explicitly.
+    [ -f /etc/inputrc ] && printf '$include /etc/inputrc\n' > "$rc"
+  fi
+  cat >> "$rc" <<'RC'
+
+# Silence readline's own bell: empty-line backspace, arrow key at the edge of
+# the line, tab with no completion. Unrelated to claude-bell, which writes BEL
+# straight to the pts and is unaffected by this.
+set bell-style none
+RC
+  c_ok "added 'set bell-style none' to ~/.inputrc (applies to new shells)"
+}
 
 # ------------------------------------------------------------------ preflight
 hdr "Preflight"
@@ -91,6 +140,20 @@ fi
 if [ -z "${SSH_TTY:-}" ] && [ -z "${SSH_CONNECTION:-}" ]; then
   c_warn "doesn't look like an SSH session; this design relies on SSH carrying"
   c_warn "the BEL back to a local terminal emulator"
+fi
+
+if readline_bell_audible; then
+  if [ "$QUIET_READLINE" = 1 ]; then
+    c_ok "readline bell is audible — will silence it (--quiet-readline)"
+  else
+    c_warn "readline's bell is audible (its default). Once your terminal plays a"
+    c_warn "sound on BEL, bash itself will beep on empty-line backspace, on an"
+    c_warn "arrow key at the edge of the line, and on tab with no completion."
+    c_warn "Those are not Claude Code. Re-run with --quiet-readline to silence"
+    c_warn "them; it does not affect this project's beeps."
+  fi
+else
+  c_ok "readline bell already silenced"
 fi
 
 [ "$FATAL" = 1 ] && { hdr "Preflight failed, aborting"; exit 1; }
@@ -294,6 +357,11 @@ fi
 c_ok "Stop → bell.sh done (one beep)"
 c_ok "Notification → bell.sh attention (two beeps)"
 
+if [ "$QUIET_READLINE" = 1 ]; then
+  hdr "Silencing readline's bell"
+  apply_quiet_readline
+fi
+
 # ----------------------------------------------------------------- self-check
 hdr "Self-check"
 
@@ -363,4 +431,14 @@ Heard nothing? Check in this order:
        no controlling tty     → background agent session, silent by design
 
   3. tmux and screen swallow BEL — see the preflight warnings above.
+
+Beeping when nothing is running? Two usual causes, neither is a hook firing:
+
+  a. bash itself. readline rings the bell on empty-line backspace, on an arrow
+     key at the edge of the line, and on tab with no completion. It always
+     did; you only hear it now that BEL plays a sound. Fix:
+       ./install.sh --quiet-readline
+
+  b. A background agent session. Silent by design here — check the log; if
+     nothing was appended when you heard the beep, it wasn't this project.
 EOF
