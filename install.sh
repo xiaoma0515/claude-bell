@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  claude-bell — terminal notification sound for Claude Code on headless boxes
+#
+#  A headless server has no sound card and no DISPLAY, so `paplay` and
+#  `notify-send` are both dead ends. What does work: write a BEL byte (\a)
+#  into the pts that Claude Code is attached to. SSH carries it back to your
+#  local terminal emulator, which plays a sound.
+#
+#      VPS: bell.sh writes \a ──SSH byte stream──> PC: terminal plays a sound
+#           ^ this installer sets up this half     ^ configure once on your PC,
+#                                                    applies to every host
+#
+#  Usage:
+#      ./install.sh              install / upgrade (idempotent)
+#      ./install.sh --check      preflight only, touches nothing
+#      ./install.sh --uninstall  remove hook and script
+#
+#  Remote one-liner:
+#      bash <(curl -fsSL https://raw.githubusercontent.com/xiaoma0515/claude-bell/main/install.sh)
+#
+#      Use process substitution, not `curl ... | bash`. A piped shell has no
+#      controlling terminal, so the post-install self-check will report a
+#      false failure (and you won't hear the test beep).
+# ============================================================================
+set -uo pipefail
+
+VERSION=1.0.0
+
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+HOOK_DIR="$CLAUDE_DIR/hooks"
+BELL="$HOOK_DIR/bell.sh"
+SETTINGS="$CLAUDE_DIR/settings.json"
+
+c_ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+c_warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
+c_err()  { printf '  \033[31m✗\033[0m %s\n' "$*"; }
+hdr()    { printf '\n\033[1m%s\033[0m\n' "$*"; }
+
+MODE=install
+case "${1:-}" in
+  --uninstall) MODE=uninstall ;;
+  --check)     MODE=check ;;
+  --version)   echo "claude-bell $VERSION"; exit 0 ;;
+  --help|-h)   sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  "")          ;;
+  *)           c_err "unknown argument: $1 (try --help)"; exit 2 ;;
+esac
+
+# ------------------------------------------------------------------ preflight
+hdr "Preflight"
+FATAL=0
+
+if [ -n "${BASH_VERSION:-}" ]; then
+  c_ok "bash $BASH_VERSION"
+else
+  c_err "not running under bash — re-run with: bash install.sh"; FATAL=1
+fi
+
+# Hard requirement: procps-style ps. BusyBox ps does not support -o.
+if ps -o tty= -p $$ >/dev/null 2>&1 && ps -o ppid= -p $$ >/dev/null 2>&1; then
+  c_ok "ps supports -o tty= / -o ppid="
+else
+  c_err "ps lacks -o tty= (BusyBox?) — install procps"; FATAL=1
+fi
+
+if command -v python3 >/dev/null 2>&1; then
+  c_ok "python3 (for merging settings.json)"
+  JSON_TOOL=python3
+elif command -v jq >/dev/null 2>&1; then
+  c_ok "jq (for merging settings.json)"
+  JSON_TOOL=jq
+else
+  c_err "need python3 or jq to merge settings.json safely"; FATAL=1; JSON_TOOL=none
+fi
+
+if command -v claude >/dev/null 2>&1; then
+  c_ok "claude: $(command -v claude)"
+else
+  c_warn "claude not on PATH — the hook installs fine but nothing will fire it"
+fi
+
+# Non-fatal, but each of these silently swallows the bell.
+if [ -n "${TMUX:-}" ]; then
+  c_warn "inside tmux — it eats BEL by default. Add to ~/.tmux.conf:"
+  printf '        set -g bell-action any\n        set -g visual-bell off\n'
+fi
+if [ -n "${STY:-}" ]; then
+  c_warn "inside screen — add to ~/.screenrc:  vbell off"
+fi
+if [ -z "${SSH_TTY:-}" ] && [ -z "${SSH_CONNECTION:-}" ]; then
+  c_warn "doesn't look like an SSH session; this design relies on SSH carrying"
+  c_warn "the BEL back to a local terminal emulator"
+fi
+
+[ "$FATAL" = 1 ] && { hdr "Preflight failed, aborting"; exit 1; }
+[ "$MODE" = check ] && { hdr "Preflight passed (--check: nothing was modified)"; exit 0; }
+
+# ------------------------------------------------------------------ uninstall
+if [ "$MODE" = uninstall ]; then
+  hdr "Uninstall"
+  if [ -f "$SETTINGS" ] && command -v python3 >/dev/null 2>&1; then
+    cp -p "$SETTINGS" "$SETTINGS.bak.$(date +%Y%m%d%H%M%S)"
+    python3 - "$SETTINGS" <<'PY'
+import json, sys
+p = sys.argv[1]
+cfg = json.load(open(p))
+hooks = cfg.get("hooks", {})
+for ev in list(hooks):
+    groups = []
+    for g in hooks[ev]:
+        inner = [h for h in g.get("hooks", []) if "bell.sh" not in h.get("command", "")]
+        if inner:
+            g["hooks"] = inner
+            groups.append(g)
+    if groups: hooks[ev] = groups
+    else:      del hooks[ev]
+if not hooks: cfg.pop("hooks", None)
+with open(p, "w") as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PY
+    c_ok "removed bell.sh hooks from settings.json (backup kept)"
+  fi
+  rm -f "$BELL" && c_ok "removed $BELL"
+  hdr "Done"
+  exit 0
+fi
+
+# --------------------------------------------------------------- write bell.sh
+hdr "Installing bell.sh"
+mkdir -p "$HOOK_DIR"
+[ -f "$BELL" ] && cp -p "$BELL" "$BELL.bak.$(date +%Y%m%d%H%M%S)"
+
+cat > "$BELL" <<'BELL_EOF'
+#!/usr/bin/env bash
+# Claude Code notification bell — usage: bell.sh [done|attention]
+# Generated by claude-bell's install.sh. Don't edit; reinstalling overwrites it.
+#
+# Headless box: no sound card, no DISPLAY. Write BEL (\a) into the pts the
+# user is on; SSH carries it to the local terminal emulator, which plays a
+# sound.
+#
+# Two strategies for locating the tty:
+#   1. /dev/tty — the controlling terminal. Foreground sessions take this.
+#   2. Walk up the process tree looking for an ancestor that has a tty.
+#   Both failing means the caller has no controlling terminal at all, i.e.
+#   it's a background agent session → exit silently.
+#
+# Why there is deliberately no third "fall back to the most recently active
+# login pts" strategy (this was tried, and it was a bug): settings.json is
+# global, and one machine often runs several Claude sessions at once
+# (background agents, other projects' sessions). Every one of them fires its
+# own Stop hook. A fallback aims the BEL at whichever pts was most recently
+# active — which is the idle window the user happens to be staring at. It
+# shows up as "it keeps beeping when nothing is running". Better to stay
+# silent for background work than to beep on the wrong terminal.
+#
+# Gotcha: do NOT test with `[ -w /dev/tty ]`. /dev/tty is mode 0666, so
+# access(2) always succeeds, but open() returns ENXIO when the process has no
+# controlling terminal. You have to actually try to open it, or strategy 1
+# false-positives and strategy 2 never runs.
+
+pattern="${1:-done}"
+log="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/bell.log"
+say() { echo "$(date '+%F %T') [$pattern] $*" >> "$log"; }
+
+# Keep the log from growing without bound.
+if [ -f "$log" ] && [ "$(wc -l < "$log" 2>/dev/null || echo 0)" -gt 2000 ]; then
+  tail -n 500 "$log" > "$log.tmp" 2>/dev/null && mv "$log.tmp" "$log"
+fi
+
+# Genuinely attempt to open for writing. O_TRUNC is a no-op on a char device,
+# so this emits nothing.
+can_write() { { : > "$1"; } 2>/dev/null; }
+
+tty_dev=""
+
+# --- strategy 1: controlling terminal ---
+if can_write /dev/tty; then
+  tty_dev="/dev/tty"
+  say "strategy1 /dev/tty OK"
+fi
+
+# --- strategy 2: walk up the process tree ---
+if [ -z "$tty_dev" ]; then
+  pid=$PPID
+  for _ in 1 2 3 4 5 6 7 8; do
+    if [ -z "$pid" ] || [ "$pid" = 0 ]; then break; fi
+    t=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
+    if [ -n "$t" ] && [ "$t" != "?" ] && can_write "/dev/$t"; then
+      tty_dev="/dev/$t"
+      say "strategy2 walk found $tty_dev"
+      break
+    fi
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+  done
+fi
+
+# --- no tty means a background agent session: stay silent ---
+if [ -z "$tty_dev" ]; then
+  say "skip: no controlling tty (background session)"
+  exit 0
+fi
+
+case "$pattern" in
+  done)
+    printf '\a' > "$tty_dev" 2>/dev/null
+    ;;
+  attention)
+    printf '\a' > "$tty_dev" 2>/dev/null
+    sleep 0.6
+    printf '\a' > "$tty_dev" 2>/dev/null
+    ;;
+  *)
+    # Unknown pattern (the installer's self-check uses these): record where we
+    # would have written, but emit nothing.
+    say "dry-run, no BEL"
+    exit 0
+    ;;
+esac
+
+say "BEL sent to $tty_dev"
+exit 0
+BELL_EOF
+
+chmod +x "$BELL"
+c_ok "wrote $BELL"
+
+# --------------------------------------------------------- merge settings.json
+hdr "Configuring hooks"
+[ -f "$SETTINGS" ] && cp -p "$SETTINGS" "$SETTINGS.bak.$(date +%Y%m%d%H%M%S)" \
+  && c_ok "backed up existing settings.json"
+
+if [ "$JSON_TOOL" = python3 ]; then
+  python3 - "$SETTINGS" "$BELL" <<'PY'
+import json, os, sys
+path, script = sys.argv[1], sys.argv[2]
+
+if os.path.exists(path):
+    with open(path) as f:
+        raw = f.read().strip()
+    try:
+        cfg = json.loads(raw) if raw else {}
+    except json.JSONDecodeError as e:
+        sys.exit(f"settings.json is not valid JSON, refusing to touch it: {e}")
+else:
+    cfg = {}
+
+hooks = cfg.setdefault("hooks", {})
+
+for event, arg in (("Stop", "done"), ("Notification", "attention")):
+    groups = hooks.setdefault(event, [])
+    # Drop any pre-existing bell.sh entries first, so reinstalling is
+    # idempotent and never stacks up duplicate beeps.
+    cleaned = []
+    for g in groups:
+        inner = [h for h in g.get("hooks", []) if "bell.sh" not in h.get("command", "")]
+        if inner:
+            g["hooks"] = inner
+            cleaned.append(g)
+    cleaned.append({
+        "matcher": "*",
+        "hooks": [{"type": "command", "timeout": 5, "command": f"{script} {arg}"}],
+    })
+    hooks[event] = cleaned
+
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PY
+  rc=$?
+else
+  tmp=$(mktemp)
+  [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
+  jq --arg s "$BELL" '
+    def strip($ev): if .hooks[$ev] then
+        .hooks[$ev] |= (map(.hooks |= map(select(.command | contains("bell.sh") | not)))
+                        | map(select(.hooks | length > 0)))
+      else . end;
+    .hooks //= {}
+    | strip("Stop") | strip("Notification")
+    | .hooks.Stop = ((.hooks.Stop // []) + [{matcher:"*",hooks:[{type:"command",timeout:5,command:($s+" done")}]}])
+    | .hooks.Notification = ((.hooks.Notification // []) + [{matcher:"*",hooks:[{type:"command",timeout:5,command:($s+" attention")}]}])
+  ' "$SETTINGS" > "$tmp" && mv "$tmp" "$SETTINGS"
+  rc=$?
+fi
+
+if [ "$rc" != 0 ]; then
+  c_err "failed to merge settings.json; original untouched (see backup above)"
+  exit 1
+fi
+c_ok "Stop → bell.sh done (one beep)"
+c_ok "Notification → bell.sh attention (two beeps)"
+
+# ----------------------------------------------------------------- self-check
+hdr "Self-check"
+
+# Pull our own log lines by tag. Several Claude sessions may be running on the
+# same box, all appending to this log from their own Stop hooks, so `tail -n1`
+# can easily pick up someone else's line.
+# Each run writes two lines (where it resolved + a dry-run marker); we want the
+# first, hence filtering out dry-run.
+grab() {
+  grep -F "[$1]" "$HOOK_DIR/bell.log" 2>/dev/null | grep -vF 'dry-run' | tail -n1
+}
+
+# --- foreground: should resolve a tty ---
+"$BELL" selftest-fg >/dev/null 2>&1
+fg_line=$(grab selftest-fg)
+if echo "$fg_line" | grep -q "strategy[12]"; then
+  c_ok "foreground resolved tty: $(echo "$fg_line" | grep -o '/dev/[a-z0-9/]*' | tail -1)"
+else
+  c_warn "foreground found no tty — expected if you ran this over a pipe or ssh without -t"
+fi
+
+# --- background: should stay silent ---
+# setsid only forks when the caller is already a process group leader;
+# otherwise it calls setsid() in place and PPID is unchanged, so strategy 2
+# happily walks up to the caller's tty and the test fails spuriously. Force
+# --fork and have the child sleep first, so it is reparented to init (PPID=1)
+# before bell.sh runs. That actually reproduces a background agent's process
+# environment.
+if ! command -v setsid >/dev/null 2>&1; then
+  c_warn "no setsid (util-linux) — skipping background-silence check"
+else
+  if setsid --fork true 2>/dev/null; then SETSID="setsid --fork"; else SETSID="setsid"; fi
+  $SETSID bash -c 'sleep 0.5; exec "$0" selftest-bg' "$BELL" </dev/null >/dev/null 2>&1
+  sleep 1.5
+  bg_line=$(grab selftest-bg)
+  if echo "$bg_line" | grep -q "no controlling tty"; then
+    c_ok "background session correctly stays silent"
+  elif [ -z "$bg_line" ]; then
+    c_warn "background check produced no log line (see $HOOK_DIR/bell.log)"
+  else
+    c_err "background session did NOT stay silent! It resolved: $bg_line"
+    c_err "  → this causes phantom beeps; check whether bell.sh grew a fallback strategy"
+  fi
+fi
+
+# --- real beep ---
+hdr "Beeping once now — if you hear it, the whole chain works"
+"$BELL" done
+sleep 0.4
+
+cat <<EOF
+
+$(printf '\033[1mInstalled\033[0m')
+
+  script    $BELL
+  config    $SETTINGS
+  log       $HOOK_DIR/bell.log
+
+Heard nothing? Check in this order:
+
+  1. Your local terminal must be configured to play a sound on BEL.
+     This is a PC-side setting, done once, and applies to every host you SSH
+     into — it has nothing to do with the server. See the README.
+
+  2. tail $HOOK_DIR/bell.log
+       strategy1 / strategy2  → located fine, so the problem is PC-side
+       no controlling tty     → background agent session, silent by design
+
+  3. tmux and screen swallow BEL — see the preflight warnings above.
+EOF
