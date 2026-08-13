@@ -339,7 +339,13 @@ if [ "$pattern" = listen ]; then
     *) echo "bell.sh listen: needs a real terminal (got: ${mytty:-none})" >&2; exit 1 ;;
   esac
   printf '%s %s\n' "$$" "$mytty" > "$reg"
-  trap 'rm -f "$reg"' EXIT INT TERM HUP
+  # EXIT does the cleanup; the signal traps exist only to reach it. Handling
+  # HUP without an explicit exit is the trap that looks right and isn't:
+  # bash runs the handler and then RESUMES the loop, so closing the tab
+  # deregisters correctly but leaves the process running forever — one
+  # orphan per disconnect, accumulating silently.
+  trap 'rm -f "$reg"' EXIT
+  trap 'exit 0' INT TERM HUP
   say "listener registered on $mytty (pid $$)"
   echo "claude-bell: this terminal is now the 'Claude needs you' sound."
   echo "Its profile's bellSound is what you will hear for permission prompts"
