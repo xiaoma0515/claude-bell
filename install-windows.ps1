@@ -231,13 +231,25 @@ if (-not $SshCommand) {
         $SshCommand = $sshProfiles[$idx - 1].commandline
     }
     else {
-        throw "No SSH profile found. Re-run with -SshCommand ""ssh yourhost""."
+        # Plenty of people never make an SSH profile - they open a normal
+        # shell tab and type ssh. Ask instead of dead-ending on an error.
+        Hdr "No SSH profile found in Windows Terminal"
+        Write-Host "  How do you reach the box? e.g.  xiao@203.0.113.9   or   ssh myserver -p 2222"
+        $answer = Read-Host "  ssh target"
+        if (-not $answer -or -not $answer.Trim()) {
+            throw "Nothing entered. Re-run with -SshCommand ""ssh yourhost""."
+        }
+        $SshCommand = $answer
     }
 }
 
+# Accept a bare target ("user@host") as readily as a full command line.
+$SshCommand = $SshCommand.Trim()
+if ($SshCommand -notmatch '\bssh(\.exe)?\b') { $SshCommand = "ssh $SshCommand" }
+
 # -t is not optional: listen mode refuses to run without a real tty, and
 # `ssh host <cmd>` doesn't allocate one.
-$cmdline = '{0} -t "{1} listen"' -f $SshCommand.Trim(), $RemoteBellPath
+$cmdline = '{0} -t "{1} listen"' -f $SshCommand, $RemoteBellPath
 
 # ------------------------------------------------------------------- the wav
 Hdr "Alert sound"
