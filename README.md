@@ -103,8 +103,10 @@ Beep count is one axis; timbre is the other — and over SSH the timbre looks lo
 **Windows Terminal — one command, on your PC:**
 
 ```powershell
-.\install-windows.ps1
+powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
 ```
+
+(Plain `.\install-windows.ps1` works too *if* your execution policy already allows local scripts. Windows ships as `Restricted`, where running a `.ps1` fails with "running scripts is disabled on this system" — the `-ExecutionPolicy Bypass` form sidesteps that for this one run without changing any machine setting.)
 
 It synthesizes a short beep-beep wav (no download), adds a profile that plays it on BEL, and points that profile's command line straight at `bell.sh listen` — so opening the tab *is* the setup, with nothing to type. It reuses your existing SSH profile's command line, backs up `settings.json`, and is safe to re-run. `-Uninstall` removes it again.
 

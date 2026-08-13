@@ -102,8 +102,10 @@ cd claude-bell && ./install.sh
 **Windows Terminal —— 在你 PC 上跑一条命令：**
 
 ```powershell
-.\install-windows.ps1
+powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
 ```
+
+（如果你的执行策略本来就允许跑本地脚本，直接 `.\install-windows.ps1` 也行。Windows 出厂是 `Restricted`，这种情况下跑 `.ps1` 会报 "running scripts is disabled on this system" —— 上面这种写法只对这一次运行放行，不改动系统任何设置。）
 
 它会当场合成一个短促的「滴滴」wav（不用下载）、加一个把 BEL 映射到这个音的 profile，并把该 profile 的启动命令直接设成 `bell.sh listen` —— 于是**开标签页本身就是全部操作**，不用敲任何命令。它复用你现有 SSH profile 的连接命令、先备份 `settings.json`、可重复运行；`-Uninstall` 原样撤销。
 

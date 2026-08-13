@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     claude-bell, PC half — give "Claude needs you" a sound of its own.
 
@@ -22,8 +22,11 @@
     Re-run any time; it updates in place. -Uninstall removes the profile.
 
 .EXAMPLE
-    .\install-windows.ps1
-    Auto-detects your SSH profile and reuses its command line.
+    powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
+    Auto-detects your SSH profile and reuses its command line. Use this form
+    if plain .\install-windows.ps1 reports that running scripts is disabled:
+    Windows ships with the Restricted execution policy, and this bypasses it
+    for one run without changing any machine setting.
 
 .EXAMPLE
     .\install-windows.ps1 -SshCommand "ssh myserver"
