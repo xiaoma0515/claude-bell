@@ -81,10 +81,18 @@ Your terminal has to actually make noise when it receives BEL. Once per machine,
 
 ## What triggers it
 
-| Hook | When | Sound |
+Two sounds, two meanings:
+
+| Sound | Meaning | Wiring |
 |---|---|---|
-| `Stop` | Claude finishes a turn | one beep |
-| `Notification` | Claude wants your attention (permission prompt, idle) | two beeps |
+| **1 beep** | *Your* session finished its turn | `Stop` hook |
+| **2 beeps** | Claude is blocked on you: a tool permission, a question, an MCP form, a background agent waiting for input | `Notification` hook, matchers `permission_prompt` / `elicitation_dialog` / `elicitation_url_dialog` / `agent_needs_input` |
+
+And three things that used to beep but no longer do (since 1.2):
+
+- **Subagents and teammates finishing.** A session spawned as a subordinate agent (agent teams, sessions started from the `claude agents` UI) fires `Stop` after *every* message exchange — long before the job you actually care about is done, which made it ring false "done" beeps on your terminal. Spawned sessions carry env markers (`CLAUDE_CODE_SESSION_KIND=bg`, `CLAUDE_BG_SOURCE`, `CLAUDE_CODE_SESSION_NAME`, …) that hooks inherit, so `bell.sh` recognizes where it's running and keeps "done" silent there. Their **permission prompts still ring 2 beeps** — those genuinely need you.
+- **The idle echo.** Claude Code fires an `idle_prompt` notification ~60 s after every turn end. Coming right after a "done" beep, that is a duplicate: `bell.sh` records each session's last turn-end time and swallows any `idle_prompt` within 75 s of it. An `idle_prompt` with *no* recent turn end means a dialog has been sitting unanswered — that one rings 2 beeps.
+- **Noise notification types.** `auth_success`, `agent_completed`, `elicitation_complete`, … are simply never subscribed.
 
 ## "It started beeping at random after I installed this"
 
@@ -115,25 +123,26 @@ That writes `set bell-style none` to `~/.inputrc`. It's safe: `bell.sh` writes B
 
 **Not sure whether a beep came from this project?** `bell.sh` logs every invocation. If nothing was appended to `~/.claude/hooks/bell.log` at the moment you heard it, the hook never ran and the sound came from somewhere else.
 
-## Background agents stay silent — on purpose
+## Which terminal gets the beep
 
-If you use background agents, other terminals, or several projects at once, **every one of those sessions is a full Claude Code session firing its own `Stop` hook**, because `~/.claude/settings.json` is global.
+If you use background agents, other terminals, or several projects at once, **every one of those sessions is a full Claude Code session firing the same global hooks**, because `~/.claude/settings.json` is global. Aiming the BEL is therefore the whole game.
 
-An earlier version had a third fallback strategy: if a session has no controlling terminal (which is exactly the case for background agents, since they're children of a detached daemon), aim the BEL at "the most recently active login pts". That sounds reasonable and is a bug. The most recently active pts is *the window you're currently looking at* — so a background agent finishing work in some unrelated project rings the bell on your idle foreground terminal. It reads as **"it keeps beeping when nothing is running."**
+`bell.sh` resolves a target in three steps, and if all fail it stays silent:
 
-So `bell.sh` has exactly two strategies, and no fallback:
-
-1. `/dev/tty` — the controlling terminal.
+1. `/dev/tty` — the controlling terminal. Foreground sessions take this.
 2. Walk up the process tree for an ancestor that has a tty.
+3. The tty owned by a running `claude agents` UI — for permission prompts from sessions that UI spawned, which have no tty anywhere in their ancestry.
 
-Both failing means there is no terminal that legitimately belongs to this session, and it exits silently. The trade-off is real and deliberate: background work finishes quietly, and you check on it yourself. Better than beeping on the wrong terminal.
+There is deliberately **no** "most recently active pts" fallback. An earlier version tried it: the most recently active pts is the window you're currently looking at, so a background session finishing work in some unrelated project rang the bell on your idle foreground terminal. It read as *"it keeps beeping when nothing is running."* When the target is ambiguous (several agents UIs open), `bell.sh` also stays silent rather than guessing. Better to miss a beep than to beep on the wrong terminal.
 
-Diagnosing is easy, because `bell.sh` logs which strategy won:
+Diagnosing is easy, because `bell.sh` logs every decision:
 
 ```
 $ tail ~/.claude/hooks/bell.log
-2026-07-18 09:19:11 [done] strategy2 walk found /dev/pts/5    ← foreground, correct
-2026-07-18 09:11:25 [done] skip: no controlling tty           ← background, silent
+2026-08-13 10:38:19 [done] strategy2 walk found /dev/pts/5      ← your session, rings
+2026-08-13 10:38:19 [done] skip: subordinate agent session …    ← teammate turn end, silent
+2026-08-13 10:38:20 [idle] skip: idle echo 1s after …           ← duplicate of done, silent
+2026-08-13 10:38:20 [ask]  BEL sent to /dev/pts/5               ← needs you, rings
 ```
 
 ## Troubleshooting
@@ -143,6 +152,8 @@ $ tail ~/.claude/hooks/bell.log
 | Beeps when nothing is running | Almost always readline, not a hook — see the section above. `--quiet-readline` fixes it. |
 | No sound at all | `tail ~/.claude/hooks/bell.log`. If you see `strategy1`/`strategy2`, the server side worked and the problem is your terminal config. |
 | Log says `no controlling tty` | That session is a background agent. Silent by design — see above. |
+| A subagent/teammate finishing still rings "done" | `tail bell.log` — a real fix shows `skip: subordinate agent session`. If instead you see `BEL sent`, that spawned session carries none of the known env markers; open an issue with `tr '\0' '\n' < /proc/<pid>/environ \| grep CLAUDE`. |
+| Two beeps a minute after every "done" | That's the `idle_prompt` echo the filter should eat — check the log for `skip: idle echo`. If it rings, the state dir `~/.claude/hooks/bell.state.d/` isn't writable. |
 | Nothing in the log | The hook isn't wired. Re-run `./install.sh`, and check `~/.claude/settings.json`. |
 | Silent inside tmux | tmux swallows BEL: `set -g bell-action any` + `set -g visual-bell off` |
 | Silent inside screen | `vbell off` in `~/.screenrc` |
@@ -154,6 +165,7 @@ $ tail ~/.claude/hooks/bell.log
 - bash
 - `ps` from procps (BusyBox `ps` lacks `-o tty=`; on Alpine: `apk add procps`)
 - python3 *or* jq, for safely merging `settings.json`
+- Claude Code ≥ 2.1.198 for the `agent_needs_input` notification matcher; older versions ignore unknown matchers, so everything else still works
 - an SSH session — this design has nothing to say about local consoles or the web/IDE clients, where there's no pts and it stays silent
 
 ## License

@@ -80,10 +80,18 @@ cd claude-bell && ./install.sh
 
 ## 什么时候响
 
-| Hook | 时机 | 声音 |
+两种声音，两种含义：
+
+| 声音 | 含义 | 接线 |
 |---|---|---|
-| `Stop` | Claude 干完一轮 | 一声 |
-| `Notification` | Claude 要你确认（权限提示、空闲提醒） | 两声 |
+| **一声** | **你自己的**会话干完一轮 | `Stop` hook |
+| **两声** | Claude 卡在你身上：工具权限、要你回答问题、MCP 表单、后台 agent 等你输入 | `Notification` hook，matcher 为 `permission_prompt` / `elicitation_dialog` / `elicitation_url_dialog` / `agent_needs_input` |
+
+以及三种以前会响、1.2 起不再响的情况：
+
+- **subagent / teammate 干完活。** 作为下属 agent 起的会话（agent teams、`claude agents` UI 里起的后台会话）每完成一次消息交换就触发一次 `Stop` —— 离你真正关心的任务跑完还远着呢，以前却会在你的终端上响出假的「干完了」。这类被派生的会话带着环境标志（`CLAUDE_CODE_SESSION_KIND=bg`、`CLAUDE_BG_SOURCE`、`CLAUDE_CODE_SESSION_NAME` 等），hook 会继承会话进程的环境，`bell.sh` 据此认出自己身处何地，把「done」按下不响。但它们的**权限请求照样响两声** —— 那是真的需要你。
+- **空闲回声。** Claude Code 在每轮结束约 60 秒后会发一个 `idle_prompt` 通知。紧跟在「done」一声之后的它纯属重复：`bell.sh` 按会话记录上次结束时间，75 秒内的 `idle_prompt` 直接吞掉。而**没有**近期结束记录却冒出来的 `idle_prompt`，说明有个对话框挂着没人理 —— 这种响两声。
+- **噪音通知类型。** `auth_success`、`agent_completed`、`elicitation_complete` 等根本不订阅。
 
 ## 「装完之后开始乱响」
 
@@ -112,25 +120,26 @@ cd claude-bell && ./install.sh
 
 **分不清某次响是不是本项目发的？** `bell.sh` 每次被调用都会记日志。如果你听见响的那一刻 `~/.claude/hooks/bell.log` 没有新增行，那 hook 压根没跑，声音是别处来的。
 
-## 后台 agent 刻意不响
+## 铃打到哪个终端
 
-如果你会用后台 agent、开多个终端、或者同时跑几个项目，那么**每一个会话都是完整的 Claude Code 会话，各自触发自己的 `Stop` hook** —— 因为 `~/.claude/settings.json` 是全局的。
+如果你会用后台 agent、开多个终端、或者同时跑几个项目，那么**每一个会话都是完整的 Claude Code 会话，触发的是同一套全局 hook** —— 因为 `~/.claude/settings.json` 是全局的。所以「BEL 该打到哪」就是全部问题所在。
 
-早先的版本有第三级兜底策略：会话没有控制终端时（后台 agent 正是这种情况，它们是脱离终端的 daemon 的子进程），就把 BEL 打到「最近活跃的登录 pts」。听着挺合理，其实是个 bug —— 最近活跃的 pts 就是**你正盯着的那个窗口**。于是某个不相干项目的后台 agent 干完活，铃响在你眼前这个空闲终端上。体感就是**「明明没任务却在响」**。
+`bell.sh` 按三级策略定位目标，全部失败就静音：
 
-所以现在 `bell.sh` 只有两级策略，没有兜底：
-
-1. `/dev/tty` —— 控制终端
+1. `/dev/tty` —— 控制终端，前台会话走这条
 2. 沿进程树上溯，找有 tty 的祖先
+3. 正在运行的 `claude agents` UI 所占的 tty —— 给它派生出的那些祖先里压根没有 tty 的会话发权限提示用
 
-两级都失败，说明没有任何终端是真正属于这个会话的，直接静音退出。这个取舍是明确的：后台干完不响，你自己去看。总好过响错终端。
+刻意**没有**「最近活跃的登录 pts」这种兜底。早先版本试过：最近活跃的 pts 就是**你正盯着的那个窗口**，于是某个不相干项目的后台会话干完活，铃响在你眼前这个空闲终端上，体感是**「明明没任务却在响」**。目标不明确时（同时开着好几个 agents UI）也一样静音而不是乱猜。宁可漏一声，不能响错地方。
 
-排查很简单，`bell.sh` 会记下是哪级策略赢的：
+排查很简单，`bell.sh` 每个决定都记日志：
 
 ```
 $ tail ~/.claude/hooks/bell.log
-2026-07-18 09:19:11 [done] strategy2 walk found /dev/pts/5    ← 前台，正常
-2026-07-18 09:11:25 [done] skip: no controlling tty           ← 后台，静音
+2026-08-13 10:38:19 [done] strategy2 walk found /dev/pts/5      ← 你的会话，响
+2026-08-13 10:38:19 [done] skip: subordinate agent session …    ← teammate 干完一轮，静音
+2026-08-13 10:38:20 [idle] skip: idle echo 1s after …           ← done 的回声，静音
+2026-08-13 10:38:20 [ask]  BEL sent to /dev/pts/5               ← 需要你，响
 ```
 
 ## 排查
@@ -140,6 +149,8 @@ $ tail ~/.claude/hooks/bell.log
 | 没任务却在响 | 基本都是 readline 而非 hook —— 见上一节，`--quiet-readline` 可修 |
 | 完全没声音 | `tail ~/.claude/hooks/bell.log`。看到 `strategy1`/`strategy2` 就说明服务器侧没问题，是终端配置的事 |
 | 日志写 `no controlling tty` | 那个会话是后台 agent，设计上就不响 |
+| subagent/teammate 干完还是响「done」 | `tail bell.log` —— 修好的样子是 `skip: subordinate agent session`。如果反而是 `BEL sent`，说明那个派生会话没带任何已知环境标志；提 issue 时附上 `tr '\0' '\n' < /proc/<pid>/environ \| grep CLAUDE` |
+| 每次「done」一分钟后又响两声 | 那是本该被过滤的 `idle_prompt` 回声 —— 日志里应有 `skip: idle echo`。真响了就是状态目录 `~/.claude/hooks/bell.state.d/` 写不进去 |
 | 日志里什么都没有 | hook 没接上。重跑 `./install.sh`，顺便看下 `~/.claude/settings.json` |
 | tmux 里没声 | tmux 吞 BEL：`set -g bell-action any` + `set -g visual-bell off` |
 | screen 里没声 | `~/.screenrc` 加 `vbell off` |
@@ -151,6 +162,7 @@ $ tail ~/.claude/hooks/bell.log
 - bash
 - procps 的 `ps`（BusyBox 的 `ps` 不支持 `-o tty=`；Alpine 上 `apk add procps`）
 - python3 **或** jq，用于安全合并 `settings.json`
+- Claude Code ≥ 2.1.198 才有 `agent_needs_input` 这个通知 matcher；老版本会忽略不认识的 matcher，其余功能不受影响
 - SSH 会话 —— 本地控制台、web 版、IDE 插件都没有 pts，这套方案在那些场景下静音
 
 ## License
