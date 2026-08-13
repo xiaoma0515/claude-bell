@@ -234,7 +234,7 @@ if (-not $SshCommand) {
         # Plenty of people never make an SSH profile - they open a normal
         # shell tab and type ssh. Ask instead of dead-ending on an error.
         Hdr "No SSH profile found in Windows Terminal"
-        Write-Host "  How do you reach the box? e.g.  xiao@203.0.113.9   or   ssh myserver -p 2222"
+        Write-Host "  How do you reach the box? e.g.  you@203.0.113.9   or   ssh myserver -p 2222"
         $answer = Read-Host "  ssh target"
         if (-not $answer -or -not $answer.Trim()) {
             throw "Nothing entered. Re-run with -SshCommand ""ssh yourhost""."
