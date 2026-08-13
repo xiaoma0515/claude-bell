@@ -94,6 +94,21 @@ And three things that used to beep but no longer do (since 1.2):
 - **The idle echo.** Claude Code fires an `idle_prompt` notification ~60 s after every turn end. Coming right after a "done" beep, that is a duplicate: `bell.sh` records each session's last turn-end time and swallows any `idle_prompt` within 75 s of it. An `idle_prompt` with *no* recent turn end means a dialog has been sitting unanswered — that one rings 2 beeps.
 - **Noise notification types.** `auth_success`, `agent_completed`, `elicitation_complete`, … are simply never subscribed.
 
+## A truly different sound for "Claude needs you"
+
+Beep count is one axis; timbre is the other — and over SSH the timbre looks locked, because a BEL can only ever play the one `bellSound` its terminal profile maps it to. The escape hatch: *profiles each have their own* `bellSound`. A second tab on a second profile **is** a second sound.
+
+1. Duplicate your SSH profile in your terminal and give the copy a different `bellSound` (Windows Terminal: Settings → duplicate the profile → Advanced → Bell sound; other emulators have per-profile equivalents).
+2. Open one tab with that profile, SSH to the box, and run:
+
+   ```bash
+   ~/.claude/hooks/bell.sh listen
+   ```
+
+3. Leave the tab open — it prints a test beep on start so you hear what you signed up for. Permission prompts and questions now ring **there**, with that profile's sound; "done" keeps ringing on your session terminal with the original one.
+
+`listen` registers the tab's pid and tty in `~/.claude/hooks/bell.tty.ask`. The ask/idle paths check it first (strategy 0 below) and fall back to the normal strategies when the listener is gone: closing the tab or losing the SSH connection deregisters it via a trap, and a stale file is ignored after a liveness check. One listener at a time — the most recent `listen` wins.
+
 ## "It started beeping at random after I installed this"
 
 Almost certainly **bash**, not Claude Code.
@@ -127,8 +142,9 @@ That writes `set bell-style none` to `~/.inputrc`. It's safe: `bell.sh` writes B
 
 If you use background agents, other terminals, or several projects at once, **every one of those sessions is a full Claude Code session firing the same global hooks**, because `~/.claude/settings.json` is global. Aiming the BEL is therefore the whole game.
 
-`bell.sh` resolves a target in three steps, and if all fail it stays silent:
+`bell.sh` resolves a target in four steps, and if all fail it stays silent:
 
+0. A registered `listen` terminal — ask/idle only, see the section above.
 1. `/dev/tty` — the controlling terminal. Foreground sessions take this.
 2. Walk up the process tree for an ancestor that has a tty.
 3. The tty owned by a running `claude agents` UI — for permission prompts from sessions that UI spawned, which have no tty anywhere in their ancestry.

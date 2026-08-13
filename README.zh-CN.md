@@ -93,6 +93,21 @@ cd claude-bell && ./install.sh
 - **空闲回声。** Claude Code 在每轮结束约 60 秒后会发一个 `idle_prompt` 通知。紧跟在「done」一声之后的它纯属重复：`bell.sh` 按会话记录上次结束时间，75 秒内的 `idle_prompt` 直接吞掉。而**没有**近期结束记录却冒出来的 `idle_prompt`，说明有个对话框挂着没人理 —— 这种响两声。
 - **噪音通知类型。** `auth_success`、`agent_completed`、`elicitation_complete` 等根本不订阅。
 
+## 给「Claude 需要你」换一个真正不同的音色
+
+响几声是一个维度，音色是另一个 —— 走 SSH 音色看似锁死了：BEL 只能播它所在终端 profile 配置的那**一个** `bellSound`。突破口在于：*每个 profile 各有各的* `bellSound`。第二个 profile 开的第二个标签页，**就是**第二种声音。
+
+1. 在终端里复制你的 SSH profile，给副本配一个不同的 `bellSound`（Windows Terminal：设置 → 复制 profile → 高级 → 响铃声音；其他终端也有对应的按 profile 配置项）。
+2. 用那个 profile 开一个标签页，SSH 到服务器，运行：
+
+   ```bash
+   ~/.claude/hooks/bell.sh listen
+   ```
+
+3. 标签页保持打开 —— 启动时它会发一声试音，让你先听听自己选了什么。之后权限请求和问题就响在**那边**、用那个 profile 的音色；「done」仍然在你的会话终端上响原来的音。
+
+`listen` 把标签页的 pid 和 tty 注册到 `~/.claude/hooks/bell.tty.ask`。ask/idle 路径优先查它（下文的 strategy 0），监听进程没了就自动回退到常规策略：关标签页或断线都会通过 trap 注销，残留文件也会先做存活检查再忽略。同一时间只有一个监听终端 —— 最后一次 `listen` 生效。
+
 ## 「装完之后开始乱响」
 
 基本可以断定是 **bash**，不是 Claude Code。
@@ -124,8 +139,9 @@ cd claude-bell && ./install.sh
 
 如果你会用后台 agent、开多个终端、或者同时跑几个项目，那么**每一个会话都是完整的 Claude Code 会话，触发的是同一套全局 hook** —— 因为 `~/.claude/settings.json` 是全局的。所以「BEL 该打到哪」就是全部问题所在。
 
-`bell.sh` 按三级策略定位目标，全部失败就静音：
+`bell.sh` 按四级策略定位目标，全部失败就静音：
 
+0. 注册过的 `listen` 监听终端 —— 只用于 ask/idle，见上一节
 1. `/dev/tty` —— 控制终端，前台会话走这条
 2. 沿进程树上溯，找有 tty 的祖先
 3. 正在运行的 `claude agents` UI 所占的 tty —— 给它派生出的那些祖先里压根没有 tty 的会话发权限提示用
