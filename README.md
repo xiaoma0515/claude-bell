@@ -107,6 +107,8 @@ Beep count is one axis; timbre is the other — and over SSH the timbre looks lo
 
 3. Leave the tab open — it prints a test beep on start so you hear what you signed up for. Permission prompts and questions now ring **there**, with that profile's sound; "done" keeps ringing on your session terminal with the original one.
 
+With a listener active, ask/idle drop to a **single** BEL: the timbre now carries the meaning, so the second beep is redundant — and a short "beep-beep" wav gets heard as itself rather than doubled. Without a listener, the two-beep pattern stays, since that's the only signal left.
+
 `listen` registers the tab's pid and tty in `~/.claude/hooks/bell.tty.ask`. The ask/idle paths check it first (strategy 0 below) and fall back to the normal strategies when the listener is gone: closing the tab or losing the SSH connection deregisters it via a trap, and a stale file is ignored after a liveness check. One listener at a time — the most recent `listen` wins.
 
 ## "It started beeping at random after I installed this"

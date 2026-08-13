@@ -398,6 +398,10 @@ if [ "$pattern" = ask ] || [ "$pattern" = idle ]; then
     read -r lpid ltty < "$reg" 2>/dev/null || true
     if [ -n "${lpid:-}" ] && kill -0 "$lpid" 2>/dev/null && can_write "${ltty:-}"; then
       tty_dev="$ltty"
+      # The listener's profile plays its own sound, so the timbre already
+      # carries the meaning and the second beep is just noise — one BEL, and
+      # let a "di-di" wav be heard as di-di rather than di-di...di-di.
+      single_bel=1
       say "strategy0 listener tty $ltty (pid $lpid)"
     else
       say "stale listener registration ignored"
@@ -458,8 +462,10 @@ case "$pattern" in
     ;;
   ask|idle)
     printf '\a' > "$tty_dev" 2>/dev/null
-    sleep 0.6
-    printf '\a' > "$tty_dev" 2>/dev/null
+    if [ -z "${single_bel:-}" ]; then
+      sleep 0.6
+      printf '\a' > "$tty_dev" 2>/dev/null
+    fi
     ;;
   *)
     # Unknown pattern (the installer's self-check uses these): record where we
