@@ -45,6 +45,8 @@ cd claude-bell && ./install.sh
 
 安装器是**幂等**的，随时重跑即升级。它会合并进已有的 `~/.claude/settings.json` 而不是覆盖，写入前先摘掉自己上次留下的条目（所以不会越装响得越多），动过的文件都留备份。
 
+以上是**服务器那半边**。还有一个可选的 **PC 那半边** `install-windows.ps1` —— 如果你要的不只是「响两声」，而是「Claude 需要你」时是一个真正不同的音色，见 [给「Claude 需要你」换一个真正不同的音色](#给claude-需要你换一个真正不同的音色)。
+
 ```
 ./install.sh                   安装 / 升级
 ./install.sh --check           只体检，不碰任何文件
@@ -97,14 +99,25 @@ cd claude-bell && ./install.sh
 
 响几声是一个维度，音色是另一个 —— 走 SSH 音色看似锁死了：BEL 只能播它所在终端 profile 配置的那**一个** `bellSound`。突破口在于：*每个 profile 各有各的* `bellSound`。第二个 profile 开的第二个标签页，**就是**第二种声音。
 
-1. 在终端里复制你的 SSH profile，给副本配一个不同的 `bellSound`（Windows Terminal：设置 → 复制 profile → 高级 → 响铃声音；其他终端也有对应的按 profile 配置项）。
-2. 用那个 profile 开一个标签页，SSH 到服务器，运行：
+**Windows Terminal —— 在你 PC 上跑一条命令：**
 
-   ```bash
-   ~/.claude/hooks/bell.sh listen
-   ```
+```powershell
+.\install-windows.ps1
+```
 
-3. 标签页保持打开 —— 启动时它会发一声试音，让你先听听自己选了什么。之后权限请求和问题就响在**那边**、用那个 profile 的音色；「done」仍然在你的会话终端上响原来的音。
+它会当场合成一个短促的「滴滴」wav（不用下载）、加一个把 BEL 映射到这个音的 profile，并把该 profile 的启动命令直接设成 `bell.sh listen` —— 于是**开标签页本身就是全部操作**，不用敲任何命令。它复用你现有 SSH profile 的连接命令、先备份 `settings.json`、可重复运行；`-Uninstall` 原样撤销。
+
+```powershell
+.\install-windows.ps1 -SshCommand "ssh myserver"   # 自动识别不了时手工指定
+.\install-windows.ps1 -Uninstall
+```
+
+**其他终端 —— 同样的事手工做一遍：**
+
+1. 复制你的 SSH profile，给副本配一个不同的响铃音（iTerm2、kitty、WezTerm、GNOME Terminal 都是按 profile 配的）。
+2. 用那个 profile 开一个标签页，SSH 到服务器，运行 `~/.claude/hooks/bell.sh listen`。
+
+两种方式都一样：标签页保持打开 —— 连上时会发一声试音，让你先听听自己选了什么。之后权限请求和问题就响在**那边**、用那个 profile 的音色；「done」仍然在你的会话终端上响原来的音。
 
 有监听终端时，ask/idle 只发**一声** BEL：音色已经承担了区分职责，第二声纯属多余 —— 而且一个短促的「滴滴」wav 本来就该听成滴滴，而不是滴滴…滴滴。没有监听终端时仍然响两声，因为那时候节奏是唯一的区分信号。
 

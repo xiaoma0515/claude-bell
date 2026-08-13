@@ -46,6 +46,8 @@ cd claude-bell && ./install.sh
 
 The installer is **idempotent** — re-run it any time to upgrade. It merges into an existing `~/.claude/settings.json` rather than overwriting, strips its own previous entries so beeps never stack up, and backs up anything it touches.
 
+That's the **server half**. There is an optional **PC half**, `install-windows.ps1`, if you want "Claude needs you" to sound genuinely different rather than just beep twice — see [A truly different sound](#a-truly-different-sound-for-claude-needs-you).
+
 ```
 ./install.sh                   install / upgrade
 ./install.sh --check           preflight only, touches nothing
@@ -98,14 +100,25 @@ And three things that used to beep but no longer do (since 1.2):
 
 Beep count is one axis; timbre is the other — and over SSH the timbre looks locked, because a BEL can only ever play the one `bellSound` its terminal profile maps it to. The escape hatch: *profiles each have their own* `bellSound`. A second tab on a second profile **is** a second sound.
 
-1. Duplicate your SSH profile in your terminal and give the copy a different `bellSound` (Windows Terminal: Settings → duplicate the profile → Advanced → Bell sound; other emulators have per-profile equivalents).
-2. Open one tab with that profile, SSH to the box, and run:
+**Windows Terminal — one command, on your PC:**
 
-   ```bash
-   ~/.claude/hooks/bell.sh listen
-   ```
+```powershell
+.\install-windows.ps1
+```
 
-3. Leave the tab open — it prints a test beep on start so you hear what you signed up for. Permission prompts and questions now ring **there**, with that profile's sound; "done" keeps ringing on your session terminal with the original one.
+It synthesizes a short beep-beep wav (no download), adds a profile that plays it on BEL, and points that profile's command line straight at `bell.sh listen` — so opening the tab *is* the setup, with nothing to type. It reuses your existing SSH profile's command line, backs up `settings.json`, and is safe to re-run. `-Uninstall` removes it again.
+
+```powershell
+.\install-windows.ps1 -SshCommand "ssh myserver"   # if auto-detection can't pick
+.\install-windows.ps1 -Uninstall
+```
+
+**Any other terminal — the same thing by hand:**
+
+1. Duplicate your SSH profile and give the copy a different bell sound (iTerm2, kitty, WezTerm and GNOME Terminal all scope this per profile).
+2. Open one tab with that profile, SSH to the box, and run `~/.claude/hooks/bell.sh listen`.
+
+Either way: leave the tab open — it beeps once on connect so you hear what you signed up for. Permission prompts and questions now ring **there**, with that profile's sound; "done" keeps ringing on your session terminal with the original one.
 
 With a listener active, ask/idle drop to a **single** BEL: the timbre now carries the meaning, so the second beep is redundant — and a short "beep-beep" wav gets heard as itself rather than doubled. Without a listener, the two-beep pattern stays, since that's the only signal left.
 
