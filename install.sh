@@ -26,7 +26,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION=1.3.0
+VERSION=1.4.0
 
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 HOOK_DIR="$CLAUDE_DIR/hooks"
@@ -255,6 +255,19 @@ cat > "$BELL" <<'BELL_EOF'
 #                   lose the connection) and everything falls back to the
 #                   normal single-sound behavior.
 #
+# Since 1.4:
+#   - done stays silent while the session has background work in flight
+#     (background_tasks in the Stop payload). Claude fires Stop every time
+#     the main agent yields, including "said something, now waiting for a
+#     background subagent" — that Stop is a pause, not a finish, and used to
+#     ring "done" at every wake-up of a long task.
+#   - ask is also wired to PreToolUse(AskUserQuestion), so a question rings
+#     the moment it is asked instead of ~7 s later when the permission_prompt
+#     notification for the same dialog arrives. The pair is deduped: one ask
+#     per session per 15 s.
+#   - a listener tab gets a one-line summary with each BEL:
+#     [HH:MM:SS] <project dir> · <type> · <message or question>
+#
 # How the script knows it runs inside a subordinate session: spawned agent
 # sessions carry env markers (CLAUDE_CODE_SESSION_KIND=bg, CLAUDE_BG_SOURCE,
 # CLAUDE_BG_BACKEND, CLAUDE_CODE_SESSION_NAME) and hook commands inherit the
@@ -306,7 +319,7 @@ fi
 # stdin is not a tty: run by hand, stdin IS the tty and cat would block.
 payload=""
 if [ ! -t 0 ]; then
-  payload=$(head -c 8192 2>/dev/null | tr -d '\n')
+  payload=$(cat 2>/dev/null | tr -d '\n')
 fi
 jfield() {
   printf '%s' "$payload" \
@@ -314,6 +327,46 @@ jfield() {
 }
 sid=$(jfield session_id)
 [ -n "$sid" ] || sid=unknown
+
+# Beyond flat string fields — the background_tasks array, the question text
+# nested in tool_input — sed is not a JSON parser. python3 is used when it is
+# there and skipped when it is not: the summary line is thinner then, and the
+# in-flight check becomes a substring test on the tail of the payload.
+inflight=0; ntype=""; message=""; tool=""; question=""; cwd_base=""
+if [ -n "$payload" ] && command -v python3 >/dev/null 2>&1; then
+  read -r -d '' parser <<'PY'
+import sys, json, os, re
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+def clean(s, n=160):
+    return re.sub(r'[\x00-\x1f\x7f]+', ' ', str(s or '')).strip()[:n]
+inflight = 0
+for t in d.get('background_tasks') or []:
+    st = t.get('status') if isinstance(t, dict) else None
+    if st is None or st in ('running', 'pending', 'backgrounded'):
+        inflight += 1
+ti = d.get('tool_input') or {}
+qs = ti.get('questions') if isinstance(ti, dict) else None
+q = qs[0].get('question', '') if isinstance(qs, list) and qs and isinstance(qs[0], dict) else ''
+print(inflight)
+for v in (d.get('notification_type'), d.get('message'), d.get('tool_name'), q,
+          os.path.basename(d.get('cwd') or '')):
+    print(clean(v))
+PY
+  parsed=$(printf '%s' "$payload" | python3 -c "$parser" 2>/dev/null)
+  { read -r inflight; read -r ntype; read -r message; read -r tool
+    read -r question; read -r cwd_base; } <<< "$parsed"
+  [ "$inflight" -eq "$inflight" ] 2>/dev/null || inflight=0
+elif [ -n "$payload" ]; then
+  ntype=$(jfield notification_type); message=$(jfield message)
+  tool=$(jfield tool_name); cwd_base=$(basename "$(jfield cwd)" 2>/dev/null)
+  if printf '%s' "$payload" | grep -q '"background_tasks"[[:space:]]*:[[:space:]]*\[[[:space:]]*{'; then
+    inflight=$(printf '%s' "$payload" | sed 's/.*"background_tasks"[[:space:]]*:[[:space:]]*//' \
+               | grep -o '"status"[[:space:]]*:[[:space:]]*"\(running\|pending\|backgrounded\)"' | wc -l)
+  fi
+fi
 
 # --- subordinate agent session? ---
 # See header. Checked marker by marker rather than as a prefix glob, so a
@@ -336,7 +389,16 @@ if [ "$pattern" = listen ]; then
   mytty=$(tty 2>/dev/null)
   case "$mytty" in
     /dev/*) : ;;
-    *) echo "bell.sh listen: needs a real terminal (got: ${mytty:-none})" >&2; exit 1 ;;
+    *)
+      # Almost always `ssh host <cmd>` without -t. Say so and linger: a
+      # terminal tab that closes on exit would otherwise flash and vanish.
+      cat >&2 <<MSG
+bell.sh listen: no terminal attached (got: ${mytty:-none}), so nothing can ring here.
+  ssh allocates no tty when it is given a command unless you pass -t:
+      ssh -t <your usual ssh arguments> .claude/hooks/bell.sh listen
+This window closes in 30 s.
+MSG
+      sleep 30; exit 1 ;;
   esac
   printf '%s %s\n' "$$" "$mytty" > "$reg"
   # EXIT does the cleanup; the signal traps exist only to reach it. Handling
@@ -347,9 +409,10 @@ if [ "$pattern" = listen ]; then
   trap 'rm -f "$reg"' EXIT
   trap 'exit 0' INT TERM HUP
   say "listener registered on $mytty (pid $$)"
-  echo "claude-bell: this terminal is now the 'Claude needs you' sound."
-  echo "Its profile's bellSound is what you will hear for permission prompts"
-  echo "and questions. Keep the tab open; close it to fall back. Test beep:"
+  printf '🔔 Claude alerts listener on %s (%s) — pid %s\n' "$mytty" "$(hostname 2>/dev/null)" "$$"
+  echo "This tab is now the 'Claude needs you' sound: its profile's bellSound plays"
+  echo "for permission prompts and questions, each with a one-line summary."
+  echo "Keep the tab open; close it to fall back. Test beep:"
   printf '\a'
   while :; do sleep 86400 & wait $!; done
   exit 0
@@ -363,13 +426,34 @@ case "$pattern" in
       exit 0
     fi
     # Remember when this session last finished a turn, so the idle_prompt
-    # that follows ~60 s later can be recognized as an echo.
+    # that follows ~60 s later can be recognized as an echo. Recorded before
+    # the in-flight check below on purpose: that pause gets its idle_prompt
+    # too, and it is just as much an echo.
     mkdir -p "$state_dir" 2>/dev/null
     date +%s > "$state_dir/$sid" 2>/dev/null
     find "$state_dir" -type f -mmin +1440 -delete 2>/dev/null
+    # Stop fires every time the main agent yields, including "said something,
+    # now waiting for a background subagent". While background_tasks are in
+    # flight that is a pause, not a finish; the finish comes with a later
+    # Stop that has nothing in flight.
+    if [ "$inflight" -gt 0 ]; then
+      say "skip: $inflight background task(s) in flight (session $sid), this Stop is a pause"
+      exit 0
+    fi
     ;;
   ask)
-    : # always worth a beep, from any session
+    # Worth a beep from any session — but once per dialog. A question fires
+    # PreToolUse(AskUserQuestion) and then, several seconds later, a
+    # permission_prompt notification for the same dialog; unfiltered, one
+    # question rings twice.
+    mkdir -p "$state_dir" 2>/dev/null
+    last=$(cat "$state_dir/$sid.ask" 2>/dev/null || echo 0)
+    delta=$(( $(date +%s) - last ))
+    if [ "$delta" -lt 15 ]; then
+      say "skip: ask dedupe (session $sid), ${delta}s after its last ask: ${tool:-${ntype:-?}}"
+      exit 0
+    fi
+    date +%s > "$state_dir/$sid.ask" 2>/dev/null
     ;;
   idle)
     if [ -n "$subordinate" ]; then
@@ -467,8 +551,13 @@ case "$pattern" in
     printf '\a' > "$tty_dev" 2>/dev/null
     ;;
   ask|idle)
-    printf '\a' > "$tty_dev" 2>/dev/null
-    if [ -z "${single_bel:-}" ]; then
+    if [ -n "${single_bel:-}" ]; then
+      # The listener tab is a log as well as a bell: say what wants attention.
+      label="${ntype:-${tool:-$pattern}}"; detail="${message:-$question}"
+      printf '\a[%s] %s · %s%s\n' "$(date +%H:%M:%S)" "${cwd_base:-?}" "$label" \
+             "${detail:+ · $detail}" > "$tty_dev" 2>/dev/null
+    else
+      printf '\a' > "$tty_dev" 2>/dev/null
       sleep 0.6
       printf '\a' > "$tty_dev" 2>/dev/null
     fi
@@ -514,12 +603,16 @@ hooks = cfg.setdefault("hooks", {})
 # the user ring "ask"; idle_prompt goes through the script's echo filter as
 # "idle"; everything else (auth_success, agent_completed, …) is noise and is
 # simply not subscribed.
+# PreToolUse on AskUserQuestion rings a question the moment it is asked; the
+# permission_prompt notification for the same dialog trails it by seconds and
+# bell.sh dedupes the pair.
 PLAN = {
     "Stop": [("*", "done")],
     "Notification": [
         ("permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input", "ask"),
         ("idle_prompt", "idle"),
     ],
+    "PreToolUse": [("AskUserQuestion", "ask")],
 }
 
 for event, entries in PLAN.items():
@@ -554,13 +647,16 @@ else
                         | map(select(.hooks | length > 0)))
       else . end;
     .hooks //= {}
-    | strip("Stop") | strip("Notification")
+    | strip("Stop") | strip("Notification") | strip("PreToolUse")
     | .hooks.Stop = ((.hooks.Stop // []) + [{matcher:"*",hooks:[{type:"command",timeout:5,command:($s+" done")}]}])
     | .hooks.Notification = ((.hooks.Notification // []) + [
         {matcher:"permission_prompt|elicitation_dialog|elicitation_url_dialog|agent_needs_input",
          hooks:[{type:"command",timeout:5,command:($s+" ask")}]},
         {matcher:"idle_prompt",
          hooks:[{type:"command",timeout:5,command:($s+" idle")}]}])
+    | .hooks.PreToolUse = ((.hooks.PreToolUse // []) + [
+        {matcher:"AskUserQuestion",
+         hooks:[{type:"command",timeout:5,command:($s+" ask")}]}])
   ' "$SETTINGS" > "$tmp" && mv "$tmp" "$SETTINGS"
   rc=$?
 fi
@@ -572,6 +668,7 @@ fi
 c_ok "Stop → bell.sh done (1 beep; your own sessions only, subagents stay silent)"
 c_ok "Notification[permission/question/agent-needs-input] → bell.sh ask (2 beeps)"
 c_ok "Notification[idle_prompt] → bell.sh idle (the +60s echo after done is filtered)"
+c_ok "PreToolUse[AskUserQuestion] → bell.sh ask (rings as the question is asked; its notification is deduped)"
 
 if [ "$QUIET_READLINE" = 1 ]; then
   hdr "Silencing readline's bell"
@@ -591,7 +688,7 @@ grab() {
 }
 
 # --- foreground: should resolve a tty ---
-"$BELL" selftest-fg >/dev/null 2>&1
+"$BELL" selftest-fg </dev/null >/dev/null 2>&1
 fg_line=$(grab selftest-fg)
 if echo "$fg_line" | grep -q "strategy[12]"; then
   c_ok "foreground resolved tty: $(echo "$fg_line" | grep -o '/dev/[a-z0-9/]*' | tail -1)"
@@ -637,6 +734,17 @@ else
   c_err "  → subagent/teammate turn ends would ring as false 'done' beeps"
 fi
 
+# --- background work in flight: that Stop is a pause and must stay silent ---
+printf '{"session_id":"selftest-inflight","background_tasks":[{"task_id":"t","task_type":"local_agent","status":"running"}]}' \
+  | "$BELL" done >/dev/null 2>&1
+infl_line=$(grep -F '(session selftest-inflight)' "$HOOK_DIR/bell.log" 2>/dev/null | tail -n1)
+if echo "$infl_line" | grep -q 'in flight'; then
+  c_ok "Stop with background work in flight stays silent"
+else
+  c_err "in-flight suppression FAILED: ${infl_line:-no log line}"
+  c_err "  → a long task would ring 'done' at every background wake-up"
+fi
+
 # --- real beeps + idle-echo filter ---
 hdr "Two test sounds — first 1 beep = done, then 2 beeps = Claude needs you"
 printf '{"session_id":"selfcheck-echo"}' | "$BELL" done
@@ -650,8 +758,16 @@ else
   c_warn "idle-echo filter produced no log line (see bell.log)"
 fi
 sleep 0.4
-printf '{"session_id":"selfcheck-ask"}' | "$BELL" ask
+ask_sid="selfcheck-ask-$$"
+printf '{"session_id":"%s"}' "$ask_sid" | "$BELL" ask
 sleep 0.8
+# The permission_prompt notification that trails a question must not ring again.
+printf '{"session_id":"%s","notification_type":"permission_prompt"}' "$ask_sid" | "$BELL" ask
+if grep -F "(session $ask_sid)" "$HOOK_DIR/bell.log" 2>/dev/null | grep -q 'ask dedupe'; then
+  c_ok "a second ask within 15 s for the same session is deduped"
+else
+  c_warn "ask dedupe produced no log line (see bell.log)"
+fi
 
 cat <<EOF
 
@@ -669,9 +785,14 @@ profile maps it to — but every profile has its own. So:
      give the copy a different bellSound.
   2. Open one tab with that profile, SSH to this box, run:
        ~/.claude/hooks/bell.sh listen
+     Or make that the profile's command line — keep your usual ssh arguments
+     (a non-default -p port included) and add -t, which ssh needs to hand a
+     command a tty. A path relative to the remote home avoids ~-quoting
+     differences between shells:
+       ssh -t -p 22 you@this-box .claude/hooks/bell.sh listen
   3. Leave the tab open. Permission prompts and questions now ring THERE with
-     that profile's sound; "done" stays on your session terminal. Close the
-     tab any time to fall back to single-sound behavior.
+     that profile's sound, each with a one-line summary; "done" stays on your
+     session terminal. Close the tab any time to fall back.
 
 Heard nothing? Check in this order:
 

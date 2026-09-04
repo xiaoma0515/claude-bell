@@ -88,13 +88,18 @@ Two sounds, two meanings:
 | Sound | Meaning | Wiring |
 |---|---|---|
 | **1 beep** | *Your* session finished its turn | `Stop` hook |
-| **2 beeps** | Claude is blocked on you: a tool permission, a question, an MCP form, a background agent waiting for input | `Notification` hook, matchers `permission_prompt` / `elicitation_dialog` / `elicitation_url_dialog` / `agent_needs_input` |
+| **2 beeps** | Claude is blocked on you: a tool permission, a question, an MCP form, a background agent waiting for input | `Notification` hook, matchers `permission_prompt` / `elicitation_dialog` / `elicitation_url_dialog` / `agent_needs_input` — plus a `PreToolUse` hook on `AskUserQuestion`, so a question rings the moment it is asked rather than ~7 s later when its notification arrives |
 
 And three things that used to beep but no longer do (since 1.2):
 
 - **Subagents and teammates finishing.** A session spawned as a subordinate agent (agent teams, sessions started from the `claude agents` UI) fires `Stop` after *every* message exchange — long before the job you actually care about is done, which made it ring false "done" beeps on your terminal. Spawned sessions carry env markers (`CLAUDE_CODE_SESSION_KIND=bg`, `CLAUDE_BG_SOURCE`, `CLAUDE_CODE_SESSION_NAME`, …) that hooks inherit, so `bell.sh` recognizes where it's running and keeps "done" silent there. Their **permission prompts still ring 2 beeps** — those genuinely need you.
 - **The idle echo.** Claude Code fires an `idle_prompt` notification ~60 s after every turn end. Coming right after a "done" beep, that is a duplicate: `bell.sh` records each session's last turn-end time and swallows any `idle_prompt` within 75 s of it. An `idle_prompt` with *no* recent turn end means a dialog has been sitting unanswered — that one rings 2 beeps.
 - **Noise notification types.** `auth_success`, `agent_completed`, `elicitation_complete`, … are simply never subscribed.
+
+And two more since 1.4:
+
+- **Stop while background work is in flight.** Claude fires `Stop` every time the main agent yields — including "said something, now waiting for a background subagent". On a long task that rang "done" at every wake-up. The Stop payload carries `background_tasks`; while any of them is running, pending or backgrounded, `bell.sh` treats that Stop as a pause and stays silent. The finish still rings, with the later Stop that has nothing in flight.
+- **The second ring of a question.** An `AskUserQuestion` fires `PreToolUse` immediately and a `permission_prompt` notification for the same dialog several seconds later. Both are wired to `ask` — the hook so you hear it at once, the notification as a safety net — and `bell.sh` rings at most once per session per 15 s.
 
 ## A truly different sound for "Claude needs you"
 
@@ -125,6 +130,19 @@ Either way: leave the tab open — it beeps once on connect so you hear what you
 With a listener active, ask/idle drop to a **single** BEL: the timbre now carries the meaning, so the second beep is redundant — and a short "beep-beep" wav gets heard as itself rather than doubled. Without a listener, the two-beep pattern stays, since that's the only signal left.
 
 `listen` registers the tab's pid and tty in `~/.claude/hooks/bell.tty.ask`. The ask/idle paths check it first (strategy 0 below) and fall back to the normal strategies when the listener is gone: closing the tab or losing the SSH connection deregisters it via a trap, and a stale file is ignored after a liveness check. One listener at a time — the most recent `listen` wins.
+
+Each alert also prints one line in that tab, so it doubles as a log of what wanted you:
+
+```
+[10:32:49] myproject · AskUserQuestion · Which IP is right?
+[10:41:07] myproject · permission_prompt · Claude needs your permission to use Bash
+```
+
+Wiring `listen` into a profile by hand: keep every argument your normal SSH profile uses (a non-default `-p` port included) and add `-t` — ssh gives a command no tty otherwise, and without one the listener cannot ring; it says so and waits 30 s before exiting, so the tab doesn't just flash. A path relative to the remote home sidesteps the different `~` quoting rules of cmd, PowerShell and bash:
+
+```
+ssh -t -p 22 you@host .claude/hooks/bell.sh listen
+```
 
 ## "It started beeping at random after I installed this"
 
@@ -192,12 +210,16 @@ $ tail ~/.claude/hooks/bell.log
 | Silent inside screen | `vbell off` in `~/.screenrc` |
 | Beeps but no custom sound | Terminal is falling back to the system beep — check the `bellSound` path exists and is a `.wav`. |
 | Works locally, silent over a jump host | Nested SSH forwards the byte stream fine; make sure every hop allocates a tty (`ssh -t`). |
+| The alerts tab says "no terminal attached" and closes | Its command line lacks `-t`: `ssh host <cmd>` allocates no tty, `ssh -t host <cmd>` does. |
+| The alerts tab times out while your session tab connects fine | The box's sshd is on a non-default port and the alerts command line dropped the `-p`. Copy the session profile's full ssh arguments. |
+| "done" rings again and again during one long task | Each ring is a Stop while a background subagent runs. Since 1.4 the log shows `skip: … in flight`; if it still rings, your Claude Code predates the `background_tasks` field in the Stop payload. |
 
 ## Requirements
 
 - bash
 - `ps` from procps (BusyBox `ps` lacks `-o tty=`; on Alpine: `apk add procps`)
 - python3 *or* jq, for safely merging `settings.json`
+- python3 at runtime is optional: with it the listener line carries the question text and the in-flight check parses the payload; without it both degrade gracefully
 - Claude Code ≥ 2.1.198 for the `agent_needs_input` notification matcher; older versions ignore unknown matchers, so everything else still works
 - an SSH session — this design has nothing to say about local consoles or the web/IDE clients, where there's no pts and it stays silent
 

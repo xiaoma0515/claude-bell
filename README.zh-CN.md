@@ -87,13 +87,18 @@ cd claude-bell && ./install.sh
 | 声音 | 含义 | 接线 |
 |---|---|---|
 | **一声** | **你自己的**会话干完一轮 | `Stop` hook |
-| **两声** | Claude 卡在你身上：工具权限、要你回答问题、MCP 表单、后台 agent 等你输入 | `Notification` hook，matcher 为 `permission_prompt` / `elicitation_dialog` / `elicitation_url_dialog` / `agent_needs_input` |
+| **两声** | Claude 卡在你身上：工具权限、要你回答问题、MCP 表单、后台 agent 等你输入 | `Notification` hook，matcher 为 `permission_prompt` / `elicitation_dialog` / `elicitation_url_dialog` / `agent_needs_input`；另加一个 `PreToolUse` hook 接在 `AskUserQuestion` 上，问题一提出就响，不用等约 7 秒后的通知 |
 
 以及三种以前会响、1.2 起不再响的情况：
 
 - **subagent / teammate 干完活。** 作为下属 agent 起的会话（agent teams、`claude agents` UI 里起的后台会话）每完成一次消息交换就触发一次 `Stop` —— 离你真正关心的任务跑完还远着呢，以前却会在你的终端上响出假的「干完了」。这类被派生的会话带着环境标志（`CLAUDE_CODE_SESSION_KIND=bg`、`CLAUDE_BG_SOURCE`、`CLAUDE_CODE_SESSION_NAME` 等），hook 会继承会话进程的环境，`bell.sh` 据此认出自己身处何地，把「done」按下不响。但它们的**权限请求照样响两声** —— 那是真的需要你。
 - **空闲回声。** Claude Code 在每轮结束约 60 秒后会发一个 `idle_prompt` 通知。紧跟在「done」一声之后的它纯属重复：`bell.sh` 按会话记录上次结束时间，75 秒内的 `idle_prompt` 直接吞掉。而**没有**近期结束记录却冒出来的 `idle_prompt`，说明有个对话框挂着没人理 —— 这种响两声。
 - **噪音通知类型。** `auth_success`、`agent_completed`、`elicitation_complete` 等根本不订阅。
+
+1.4 起又多了两种：
+
+- **后台任务还在跑时的 Stop。** 主 agent 每让出一次控制权都触发一次 `Stop`，包括「说完话、转去等后台 subagent」的那一刻 —— 长任务因此每次被唤醒都响一声「done」。Stop 的 payload 里带 `background_tasks`，只要其中还有 running / pending / backgrounded 的，`bell.sh` 就把这次 Stop 当成暂停而非结束，不响。真正结束的那次 Stop 没有在途任务，照响。
+- **同一个问题响第二声。** 一次 `AskUserQuestion` 会先立刻触发 `PreToolUse`，几秒后又为同一个对话框发一个 `permission_prompt` 通知。两者都接到 `ask` 上 —— 前者让你第一时间听到，后者兜底 —— `bell.sh` 按会话 15 秒内只响一次。
 
 ## 给「Claude 需要你」换一个真正不同的音色
 
@@ -124,6 +129,19 @@ powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
 有监听终端时，ask/idle 只发**一声** BEL：音色已经承担了区分职责，第二声纯属多余 —— 而且一个短促的「滴滴」wav 本来就该听成滴滴，而不是滴滴…滴滴。没有监听终端时仍然响两声，因为那时候节奏是唯一的区分信号。
 
 `listen` 把标签页的 pid 和 tty 注册到 `~/.claude/hooks/bell.tty.ask`。ask/idle 路径优先查它（下文的 strategy 0），监听进程没了就自动回退到常规策略：关标签页或断线都会通过 trap 注销，残留文件也会先做存活检查再忽略。同一时间只有一个监听终端 —— 最后一次 `listen` 生效。
+
+每次提醒还会在那个标签页打印一行，于是它顺便成了「谁在等你」的日志：
+
+```
+[10:32:49] myproject · AskUserQuestion · Which IP is right?
+[10:41:07] myproject · permission_prompt · Claude needs your permission to use Bash
+```
+
+手工把 `listen` 写进 profile 时：把你平时 SSH profile 的参数原样保留（非默认端口的 `-p` 也别丢），再加 `-t` —— 否则 ssh 不会给命令分配 tty，监听脚本没法响；它会说明原因并停留 30 秒再退出，标签页不至于一闪而过。路径用相对远端家目录的写法，可以绕开 cmd、PowerShell、bash 对 `~` 各不相同的引号规则：
+
+```
+ssh -t -p 22 you@host .claude/hooks/bell.sh listen
+```
 
 ## 「装完之后开始乱响」
 
@@ -189,12 +207,16 @@ $ tail ~/.claude/hooks/bell.log
 | screen 里没声 | `~/.screenrc` 加 `vbell off` |
 | 响了但不是自定义音 | 终端回退到系统蜂鸣了 —— 检查 `bellSound` 路径存在且是 `.wav` |
 | 直连正常，跳板机静音 | 嵌套 SSH 转发字节流没问题，确认每一跳都分配了 tty（`ssh -t`） |
+| alerts 标签页提示 "no terminal attached" 然后关掉 | 启动命令少了 `-t`：`ssh host <cmd>` 不分配 tty，`ssh -t host <cmd>` 才分配 |
+| alerts 标签页连接超时，会话标签页却正常 | 服务器 sshd 在非默认端口，alerts 的命令把 `-p` 丢了。照抄会话 profile 的完整 ssh 参数 |
+| 一个长任务中「done」反复响 | 每一声都是后台 subagent 跑着时的一次 Stop。1.4 起日志里应有 `skip: … in flight`；还响的话，说明你的 Claude Code 版本太老，Stop payload 里没有 `background_tasks` |
 
 ## 依赖
 
 - bash
 - procps 的 `ps`（BusyBox 的 `ps` 不支持 `-o tty=`；Alpine 上 `apk add procps`）
 - python3 **或** jq，用于安全合并 `settings.json`
+- 运行时的 python3 可选：有它，监听页那行会带上问题原文，在途检查也是真正解析 payload；没有它两者都平稳降级
 - Claude Code ≥ 2.1.198 才有 `agent_needs_input` 这个通知 matcher；老版本会忽略不认识的 matcher，其余功能不受影响
 - SSH 会话 —— 本地控制台、web 版、IDE 插件都没有 pts，这套方案在那些场景下静音
 
