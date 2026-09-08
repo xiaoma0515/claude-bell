@@ -26,7 +26,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION=1.4.0
+VERSION=1.5.0
 
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 HOOK_DIR="$CLAUDE_DIR/hooks"
@@ -222,19 +222,18 @@ cat > "$BELL" <<'BELL_EOF'
 # sound.
 #
 # Two meanings, two sounds:
-#   done (1 beep)   Stop hook — YOUR session finished its turn.
-#                   Suppressed inside subordinate agent sessions (teammates,
-#                   sessions spawned by the agents UI/daemon): their Stop
-#                   fires after every message exchange, long before the
-#                   overall job is done, and used to ring the lead terminal
-#                   as a false "done".
+#   done (1 beep)   Stop hook — a session finished its turn. Your foreground
+#                   session rings on its own terminal; a session you launched
+#                   from the `claude agents` UI rings on the terminal that UI
+#                   runs in (strategy 3 below). A Stop that is only a pause —
+#                   background work still in flight — stays silent.
 #   ask  (2 beeps)  Notification hook — Claude is blocked on YOU: approve a
 #                   tool, answer a question, fill an MCP form. Wired via
 #                   typed matchers (permission_prompt, elicitation_dialog,
 #                   elicitation_url_dialog, agent_needs_input), so noise
 #                   types (auth_success, agent_completed, …) never fire it.
-#                   NOT suppressed in subordinate sessions: their permission
-#                   prompts need you just the same.
+#                   From an agents-UI session it rings on that UI's terminal,
+#                   like done.
 #   idle            Notification hook, idle_prompt type. Claude Code fires it
 #                   ~60 s after every turn end; right after a done beep that
 #                   is pure echo → suppressed, using a per-session timestamp
@@ -268,24 +267,30 @@ cat > "$BELL" <<'BELL_EOF'
 #   - a listener tab gets a one-line summary with each BEL:
 #     [HH:MM:SS] <project dir> · <type> · <message or question>
 #
-# How the script knows it runs inside a subordinate session: spawned agent
-# sessions carry env markers (CLAUDE_CODE_SESSION_KIND=bg, CLAUDE_BG_SOURCE,
-# CLAUDE_BG_BACKEND, CLAUDE_CODE_SESSION_NAME) and hook commands inherit the
-# session process's environment. A session you started yourself has none.
+# Since 1.5:
+#   - sessions launched from the `claude agents` UI ring "done" again, on the
+#     terminal the UI runs in. 1.2–1.4 silenced them as "subordinate", using
+#     the env markers spawned sessions carry (CLAUDE_CODE_SESSION_KIND=bg and
+#     friends). Two things were wrong with that: an agent you launched from
+#     the UI is your own task, and its turn end is exactly the finish you are
+#     waiting to hear; and the markers stopped reaching hook processes around
+#     Claude Code 2.1.233 anyway, so the check was dead code. The false "done"
+#     it was written for — a Stop that only waits for background work — is
+#     what the background_tasks filter above catches.
+#   - the daemon now gives each of those sessions a pty of its own, hosted by
+#     a `claude bg-pty-host` process (session → bg-pty-host → daemon). That
+#     pty is the session's controlling terminal, so strategies 1 and 2 both
+#     "succeed" on it — and no terminal emulator is attached to it, so every
+#     BEL written there vanished. bell.sh now looks for a daemon host in its
+#     ancestry first and goes straight to strategy 3 when it finds one.
 #
 # Three strategies for locating the tty:
 #   1. /dev/tty — the controlling terminal. Foreground sessions take this.
 #   2. Walk up the process tree looking for an ancestor that has a tty.
-#   3. The tty owned by a running `claude agents` UI, for the sessions it
-#      spawned, which have no tty of their own anywhere in their ancestry.
+#   3. The tty owned by a running `claude agents` UI, for the sessions the
+#      daemon hosts: their own pty is virtual (see above), and the UI is the
+#      screen the user is watching while agent work runs.
 #   All three failing means there is no terminal to aim at → exit silently.
-#
-# Why 1 and 2 are not enough: a session launched from the agents UI hangs off
-# the background daemon, not off the terminal. Its ancestry is
-# session → bg-pty-host → daemon → init, with no tty at any level, so the walk
-# in strategy 2 always comes up empty and every agent task finished in silence.
-# The UI process itself does own a tty, and that is exactly the screen the user
-# is watching while agent work runs — hence strategy 3.
 #
 # Why there is still deliberately no "fall back to the most recently active
 # login pts" strategy (this was tried, and it was a bug): settings.json is
@@ -368,15 +373,6 @@ elif [ -n "$payload" ]; then
   fi
 fi
 
-# --- subordinate agent session? ---
-# See header. Checked marker by marker rather than as a prefix glob, so a
-# future variable that merely shares the CLAUDE_ prefix can't silence us.
-subordinate=""
-if [ "${CLAUDE_CODE_SESSION_KIND:-}" = bg ] || [ -n "${CLAUDE_BG_SOURCE:-}" ] \
-   || [ -n "${CLAUDE_BG_BACKEND:-}" ] || [ -n "${CLAUDE_CODE_SESSION_NAME:-}" ]; then
-  subordinate=1
-fi
-
 # Pre-1.2 settings.json says "attention"; treat it as ask.
 [ "$pattern" = attention ] && pattern=ask
 
@@ -421,10 +417,6 @@ fi
 # --- event logic (before hunting for a tty: skips are cheap) ---
 case "$pattern" in
   done)
-    if [ -n "$subordinate" ]; then
-      say "skip: subordinate agent session (${CLAUDE_CODE_SESSION_NAME:-bg}) turn end, not your task's end"
-      exit 0
-    fi
     # Remember when this session last finished a turn, so the idle_prompt
     # that follows ~60 s later can be recognized as an echo. Recorded before
     # the in-flight check below on purpose: that pause gets its idle_prompt
@@ -456,10 +448,6 @@ case "$pattern" in
     date +%s > "$state_dir/$sid.ask" 2>/dev/null
     ;;
   idle)
-    if [ -n "$subordinate" ]; then
-      say "skip: idle_prompt in subordinate agent session"
-      exit 0
-    fi
     last=$(cat "$state_dir/$sid" 2>/dev/null || echo 0)
     delta=$(( $(date +%s) - last ))
     if [ "$delta" -le 75 ]; then
@@ -478,6 +466,32 @@ esac
 can_write() { { : > "$1"; } 2>/dev/null; }
 
 tty_dev=""
+
+# --- daemon-hosted session? ---
+# A session launched from the `claude agents` UI runs under the background
+# daemon: session → `claude bg-pty-host` → `claude daemon run`. The host gives
+# it a pty of its own, which makes it look exactly like a foreground session
+# to strategies 1 and 2 — except that nothing is attached to that pty, so a
+# BEL written there is never heard. Recognize the host in the ancestry and
+# leave the virtual pty alone; strategy 3 knows where the user is actually
+# looking. A session claimed from the daemon's spare pool keeps its
+# `bg-spare` argv, so that marker is accepted as well.
+# Only the subcommand (argv[1], plus argv[2] for `daemon run`) is inspected:
+# matching anywhere in the argv would also catch a shell whose command line
+# merely mentions these words, such as the one this very script is edited in.
+daemon_hosted=""
+pid=$PPID
+for _ in 1 2 3 4 5 6 7 8; do
+  if [ -z "$pid" ] || [ "$pid" -le 1 ] 2>/dev/null; then break; fi
+  read -r a0 sub sub2 _rest <<< "$(ps -o args= -p "$pid" 2>/dev/null)"
+  case "${sub:-} ${sub2:-}" in
+    "bg-pty-host "*|"bg-spare "*|"daemon run")
+      daemon_hosted=1
+      say "daemon-hosted session (ancestor pid $pid: ${a0##*/} $sub), its pty is virtual - skipping strategies 1-2"
+      break ;;
+  esac
+  pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+done
 
 # --- strategy 0: a dedicated "needs you" terminal, if one is listening ---
 # Only for ask/idle: "done" keeps the session terminal's own sound, which is
@@ -500,13 +514,13 @@ if [ "$pattern" = ask ] || [ "$pattern" = idle ]; then
 fi
 
 # --- strategy 1: controlling terminal ---
-if [ -z "$tty_dev" ] && can_write /dev/tty; then
+if [ -z "$tty_dev" ] && [ -z "$daemon_hosted" ] && can_write /dev/tty; then
   tty_dev="/dev/tty"
   say "strategy1 /dev/tty OK"
 fi
 
 # --- strategy 2: walk up the process tree ---
-if [ -z "$tty_dev" ]; then
+if [ -z "$tty_dev" ] && [ -z "$daemon_hosted" ]; then
   pid=$PPID
   for _ in 1 2 3 4 5 6 7 8; do
     if [ -z "$pid" ] || [ "$pid" = 0 ]; then break; fi
@@ -542,7 +556,11 @@ fi
 
 # --- no tty at all: stay silent ---
 if [ -z "$tty_dev" ]; then
-  say "skip: no controlling tty (background session)"
+  if [ -n "$daemon_hosted" ]; then
+    say "skip: no controlling tty (daemon-hosted session, no agents UI open to ring at)"
+  else
+    say "skip: no controlling tty (background session)"
+  fi
   exit 0
 fi
 
@@ -665,7 +683,7 @@ if [ "$rc" != 0 ]; then
   c_err "failed to merge settings.json; original untouched (see backup above)"
   exit 1
 fi
-c_ok "Stop → bell.sh done (1 beep; your own sessions only, subagents stay silent)"
+c_ok "Stop → bell.sh done (1 beep; agents-UI sessions ring at the UI's terminal)"
 c_ok "Notification[permission/question/agent-needs-input] → bell.sh ask (2 beeps)"
 c_ok "Notification[idle_prompt] → bell.sh idle (the +60s echo after done is filtered)"
 c_ok "PreToolUse[AskUserQuestion] → bell.sh ask (rings as the question is asked; its notification is deduped)"
@@ -724,14 +742,24 @@ else
   fi
 fi
 
-# --- subordinate suppression: a spawned agent session must not ring "done" ---
-CLAUDE_CODE_SESSION_NAME=selftest-sub "$BELL" done </dev/null >/dev/null 2>&1
-sub_line=$(grep -F '(selftest-sub)' "$HOOK_DIR/bell.log" 2>/dev/null | tail -n1)
-if echo "$sub_line" | grep -q 'skip: subordinate'; then
-  c_ok "subordinate agent session stays silent on Stop"
+# --- daemon-hosted session: must not ring into its own virtual pty ---
+# Reproduce the ancestry of a session launched from the agents UI: run bell.sh
+# under a process whose argv reads `claude bg-pty-host …`. Here that host even
+# has a real tty (this terminal), which is the harder case: bell.sh must still
+# refuse strategies 1-2 and go to the agents UI, or stay silent if none is open.
+dtag="selftest-daemon-$$"
+bash -c 'exec -a "claude bg-pty-host --bg-pty-host selftest" bash -c "\"\$1\" \"\$2\" </dev/null; exit" _ "$0" "$1"' \
+  "$BELL" "$dtag" >/dev/null 2>&1
+dh_lines=$(grep -F "[$dtag]" "$HOOK_DIR/bell.log" 2>/dev/null)
+if ! echo "$dh_lines" | grep -q 'daemon-hosted'; then
+  c_err "daemon-hosted detection FAILED: ${dh_lines:-no log line}"
+  c_err "  → agents-UI sessions would ring into a pty nobody is attached to (heard as silence)"
+elif echo "$dh_lines" | grep -q 'strategy[12]'; then
+  c_err "daemon-hosted session still resolved its own pty: $dh_lines"
+elif echo "$dh_lines" | grep -q 'strategy3'; then
+  c_ok "daemon-hosted session routed to the agents UI tty (strategy 3)"
 else
-  c_err "subordinate suppression FAILED: ${sub_line:-no log line}"
-  c_err "  → subagent/teammate turn ends would ring as false 'done' beeps"
+  c_ok "daemon-hosted session skips its virtual pty (no agents UI open right now, so silent)"
 fi
 
 # --- background work in flight: that Stop is a pause and must stay silent ---
@@ -816,10 +844,9 @@ Beeping when nothing is running? Two usual causes, neither is a hook firing:
      did; you only hear it now that BEL plays a sound. Fix:
        ./install.sh --quiet-readline
 
-  b. A subordinate agent session asking for permission. Since 1.2 its turn
-     ends are silenced (no more false "done" from subagents/teammates), but a
-     permission prompt inside one still rings 2 beeps at the agents UI
-     terminal — that is a real request waiting for you. Check the log; if
+  b. A session in the \`claude agents\` UI. Since 1.5 its turn ends ring
+     "done" and its permission prompts ring "ask" — at the terminal the UI
+     runs in, which may not be the tab you are looking at. Check the log; if
      nothing was appended when you heard the beep, it wasn't this project.
 EOF
 

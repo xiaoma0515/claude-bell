@@ -87,12 +87,11 @@ Two sounds, two meanings:
 
 | Sound | Meaning | Wiring |
 |---|---|---|
-| **1 beep** | *Your* session finished its turn | `Stop` hook |
+| **1 beep** | A session finished its turn — yours on its own terminal, one you launched from the `claude agents` UI on the terminal that UI runs in | `Stop` hook |
 | **2 beeps** | Claude is blocked on you: a tool permission, a question, an MCP form, a background agent waiting for input | `Notification` hook, matchers `permission_prompt` / `elicitation_dialog` / `elicitation_url_dialog` / `agent_needs_input` — plus a `PreToolUse` hook on `AskUserQuestion`, so a question rings the moment it is asked rather than ~7 s later when its notification arrives |
 
-And three things that used to beep but no longer do (since 1.2):
+And two things that used to beep but no longer do (since 1.2):
 
-- **Subagents and teammates finishing.** A session spawned as a subordinate agent (agent teams, sessions started from the `claude agents` UI) fires `Stop` after *every* message exchange — long before the job you actually care about is done, which made it ring false "done" beeps on your terminal. Spawned sessions carry env markers (`CLAUDE_CODE_SESSION_KIND=bg`, `CLAUDE_BG_SOURCE`, `CLAUDE_CODE_SESSION_NAME`, …) that hooks inherit, so `bell.sh` recognizes where it's running and keeps "done" silent there. Their **permission prompts still ring 2 beeps** — those genuinely need you.
 - **The idle echo.** Claude Code fires an `idle_prompt` notification ~60 s after every turn end. Coming right after a "done" beep, that is a duplicate: `bell.sh` records each session's last turn-end time and swallows any `idle_prompt` within 75 s of it. An `idle_prompt` with *no* recent turn end means a dialog has been sitting unanswered — that one rings 2 beeps.
 - **Noise notification types.** `auth_success`, `agent_completed`, `elicitation_complete`, … are simply never subscribed.
 
@@ -100,6 +99,10 @@ And two more since 1.4:
 
 - **Stop while background work is in flight.** Claude fires `Stop` every time the main agent yields — including "said something, now waiting for a background subagent". On a long task that rang "done" at every wake-up. The Stop payload carries `background_tasks`; while any of them is running, pending or backgrounded, `bell.sh` treats that Stop as a pause and stays silent. The finish still rings, with the later Stop that has nothing in flight.
 - **The second ring of a question.** An `AskUserQuestion` fires `PreToolUse` immediately and a `permission_prompt` notification for the same dialog several seconds later. Both are wired to `ask` — the hook so you hear it at once, the notification as a safety net — and `bell.sh` rings at most once per session per 15 s.
+
+And one thing that rings again since 1.5:
+
+- **Sessions you launch from the `claude agents` UI.** 1.2–1.4 silenced their "done" as *subordinate* sessions, on the theory that a spawned session's turn end is not the end of the job you care about. That fits subagents and teammates; it does not fit an agent you launched yourself, whose turn end is precisely the finish you are waiting for — and the env markers meant to identify spawned sessions (`CLAUDE_CODE_SESSION_KIND=bg`, …) stopped reaching hook processes around Claude Code 2.1.233 anyway. The false "done" that check was written for — a Stop that only pauses for background work — is what the `background_tasks` filter catches. So since 1.5 an agents-UI session rings "done" and "ask" like any other, at the terminal the UI runs in. What it took to make that audible is under [Which terminal gets the beep](#which-terminal-gets-the-beep).
 
 ## A truly different sound for "Claude needs you"
 
@@ -182,7 +185,7 @@ If you use background agents, other terminals, or several projects at once, **ev
 0. A registered `listen` terminal — ask/idle only, see the section above.
 1. `/dev/tty` — the controlling terminal. Foreground sessions take this.
 2. Walk up the process tree for an ancestor that has a tty.
-3. The tty owned by a running `claude agents` UI — for permission prompts from sessions that UI spawned, which have no tty anywhere in their ancestry.
+3. The tty owned by a running `claude agents` UI — for the sessions that UI launched. The background daemon hosts each of them on a pty of its own (session → `claude bg-pty-host` → `claude daemon run`). That pty is the session's controlling terminal, so it satisfies steps 1 and 2 — but nothing is attached to it, and a BEL written there is never heard. `bell.sh` therefore looks for the daemon host in its ancestry *before* steps 1 and 2 and, on finding it, skips straight here (log: `daemon-hosted session …`).
 
 There is deliberately **no** "most recently active pts" fallback. An earlier version tried it: the most recently active pts is the window you're currently looking at, so a background session finishing work in some unrelated project rang the bell on your idle foreground terminal. It read as *"it keeps beeping when nothing is running."* When the target is ambiguous (several agents UIs open), `bell.sh` also stays silent rather than guessing. Better to miss a beep than to beep on the wrong terminal.
 
@@ -190,10 +193,12 @@ Diagnosing is easy, because `bell.sh` logs every decision:
 
 ```
 $ tail ~/.claude/hooks/bell.log
-2026-08-13 10:38:19 [done] strategy2 walk found /dev/pts/5      ← your session, rings
-2026-08-13 10:38:19 [done] skip: subordinate agent session …    ← teammate turn end, silent
-2026-08-13 10:38:20 [idle] skip: idle echo 1s after …           ← duplicate of done, silent
-2026-08-13 10:38:20 [ask]  BEL sent to /dev/pts/5               ← needs you, rings
+2026-09-08 12:11:39 [done] strategy2 walk found /dev/pts/5        ← your session, rings
+2026-09-08 12:12:44 [done] skip: 1 background task(s) in flight …  ← only a pause, silent
+2026-09-08 12:13:44 [idle] skip: idle echo 60s after …             ← duplicate of done, silent
+2026-09-08 12:15:02 [done] daemon-hosted session (ancestor pid 3903217: claude bg-pty-host), …
+2026-09-08 12:15:02 [done] strategy3 agents UI tty /dev/pts/0      ← agents-UI session finished, rings where the UI is
+2026-09-08 12:15:20 [ask]  BEL sent to /dev/pts/5                  ← needs you, rings
 ```
 
 ## Troubleshooting
@@ -201,9 +206,9 @@ $ tail ~/.claude/hooks/bell.log
 | Symptom | Check |
 |---|---|
 | Beeps when nothing is running | Almost always readline, not a hook — see the section above. `--quiet-readline` fixes it. |
-| No sound at all | `tail ~/.claude/hooks/bell.log`. If you see `strategy1`/`strategy2`, the server side worked and the problem is your terminal config. |
-| Log says `no controlling tty` | That session is a background agent. Silent by design — see above. |
-| A subagent/teammate finishing still rings "done" | `tail bell.log` — a real fix shows `skip: subordinate agent session`. If instead you see `BEL sent`, that spawned session carries none of the known env markers; open an issue with `tr '\0' '\n' < /proc/<pid>/environ \| grep CLAUDE`. |
+| No sound at all | `tail ~/.claude/hooks/bell.log`. If you see `strategy1`/`strategy2`/`strategy3` followed by `BEL sent`, the server side worked and the problem is your terminal config. |
+| Log says `no controlling tty` | A background session with nowhere to ring: no terminal in its ancestry and no `claude agents` UI open. Silent by design — see above. |
+| An agents-UI session finishing is silent | `tail bell.log`. Since 1.5 you should see `daemon-hosted session …` followed by `strategy3 agents UI tty`. `strategy2 walk found` instead means the daemon's host process no longer says `bg-pty-host` / `bg-spare` in its argv — open an issue with `ps -o pid,ppid,tty,args -p <session pid>` and the same for its parent. `no controlling tty` means no agents UI was open. |
 | Two beeps a minute after every "done" | That's the `idle_prompt` echo the filter should eat — check the log for `skip: idle echo`. If it rings, the state dir `~/.claude/hooks/bell.state.d/` isn't writable. |
 | Nothing in the log | The hook isn't wired. Re-run `./install.sh`, and check `~/.claude/settings.json`. |
 | Silent inside tmux | tmux swallows BEL: `set -g bell-action any` + `set -g visual-bell off` |
